@@ -193,17 +193,87 @@ cmd_verify() {
   # -- Check 2: Inference Provider --
   echo "[2/3] Inference Provider"
   OC_CONFIG="$ADMIN_HOME/.openclaw/openclaw.json"
-  if [ -f "$OC_CONFIG" ]; then
-    ENDPOINT=$(jq -r '.models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
-    echo "  Endpoint:      $ENDPOINT"
-    echo "  Status:        PASS"
-    PASS_COUNT=$((PASS_COUNT + 1))
-  else
+  if [ ! -f "$OC_CONFIG" ]; then
     echo "  Config:        not found at $OC_CONFIG"
     echo "  Status:        FAIL"
     FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo ""
+  else
+    ENDPOINT=$(jq -r '.models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
+    echo "  Endpoint:      $ENDPOINT"
+
+    # Make a minimal request to the inference endpoint and capture response headers
+    INF_HEADERS=""
+    if [ "$ENDPOINT" != "not configured" ]; then
+      INF_HEADERS=$(curl -sI -X POST "$ENDPOINT/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d '{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+        --max-time 10 2>/dev/null) || true
+    fi
+
+    INF_PROVIDER=$(echo "$INF_HEADERS" | grep -i "^x-inference-provider:" | sed 's/[^:]*: *//' | tr -d '\r\n')
+    ATTESTATION=$(echo "$INF_HEADERS" | grep -i "^attestation-report:" | sed 's/[^:]*: *//' | tr -d '\r\n')
+
+    if [ "$INF_PROVIDER" = "redpill" ]; then
+      echo "  Provider:      redpill (failover)"
+      echo "  Attestation:   not available (confidential model, attestation via separate endpoint)"
+      echo "  Status:        WARN"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    elif [ -n "$ATTESTATION" ]; then
+      echo "  Provider:      ${INF_PROVIDER:-lunal}"
+
+      # Decode attestation: base64 → gunzip → JSON evidence
+      INF_ATTEST_OK=false
+      INF_EVIDENCE_FILE=$(mktemp /tmp/inference_attestation_XXXXXX.json)
+      if echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_EVIDENCE_FILE" 2>/dev/null; then
+        # Verify with attestation-cli if available
+        if command -v attestation-cli &>/dev/null; then
+          INF_VERIFY_RESULT=$(attestation-cli verify -e "$INF_EVIDENCE_FILE" 2>/dev/null) || true
+          if [ -n "$INF_VERIFY_RESULT" ] && echo "$INF_VERIFY_RESULT" | jq -e . &>/dev/null; then
+            INF_SIG_VALID=$(echo "$INF_VERIFY_RESULT" | jq -r '.signature_valid // false')
+            INF_PLATFORM=$(echo "$INF_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+            echo "  Platform:      $INF_PLATFORM (via tee-proxy)"
+            if [ "$INF_SIG_VALID" = "true" ]; then
+              echo "  Attestation:   valid (signature verified)"
+              INF_ATTEST_OK=true
+            else
+              echo "  Attestation:   INVALID (signature verification failed)"
+            fi
+          else
+            echo "  Attestation:   present but verification failed"
+          fi
+        else
+          echo "  Attestation:   present but no verifier (attestation-cli not found)"
+        fi
+      else
+        echo "  Attestation:   present but could not decode (base64+gzip)"
+      fi
+      rm -f "$INF_EVIDENCE_FILE"
+
+      if [ "$INF_ATTEST_OK" = "true" ]; then
+        echo "  Status:        PASS"
+        PASS_COUNT=$((PASS_COUNT + 1))
+      else
+        echo "  Status:        FAIL"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+    elif [ -n "$INF_PROVIDER" ]; then
+      echo "  Provider:      $INF_PROVIDER"
+      echo "  Attestation:   not present in response headers"
+      echo "  Status:        WARN"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    elif [ -n "$INF_HEADERS" ]; then
+      echo "  Provider:      unknown (no X-Inference-Provider header)"
+      echo "  Attestation:   not present in response headers"
+      echo "  Status:        WARN"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    else
+      echo "  Connection:    could not reach inference endpoint"
+      echo "  Status:        FAIL"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    echo ""
   fi
-  echo ""
 
   # -- Check 3: External Access Lockout --
   echo "[3/3] External Access Lockout"
