@@ -53,9 +53,17 @@ cmd_attest() {
   fi
 
   # Read HCL report (contains SNP attestation report)
-  HCL_REPORT=$(tpm2_nvread "$HCL_REPORT_NV" 2>/dev/null | xxd -p | tr -d '\n')
-  if [ -z "$HCL_REPORT" ]; then
+  # -C o = owner hierarchy auth (required for Azure CVM NV indices with ownerread attribute)
+  HCL_TMPFILE=$(mktemp)
+  if ! tpm2_nvread "$HCL_REPORT_NV" -C o -o "$HCL_TMPFILE" 2>/dev/null; then
+    rm -f "$HCL_TMPFILE"
     echo "ERROR: Failed to read HCL report from TPM NV index $HCL_REPORT_NV"
+    exit 1
+  fi
+  HCL_REPORT=$(xxd -p "$HCL_TMPFILE" | tr -d '\n')
+  rm -f "$HCL_TMPFILE"
+  if [ -z "$HCL_REPORT" ]; then
+    echo "ERROR: HCL report is empty"
     exit 1
   fi
 
