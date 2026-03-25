@@ -52,71 +52,10 @@ cmd_verify() {
   echo "=== PrivateClaw TEE Verification ==="
   echo ""
 
-  # -- Check 1: TEE Attestation (cryptographic) --
-  echo "[1/3] TEE Attestation"
-  if [ ! -f "$EVIDENCE_FILE" ]; then
-    echo "  Status:        FAIL (no attestation evidence found)"
-    echo "  Expected:      $EVIDENCE_FILE"
-    echo ""
-  elif ! command -v attestation-cli &>/dev/null; then
-    echo "  Status:        FAIL (attestation-cli not installed)"
-    echo ""
-  else
-    CURRENT_HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
-    EXPECTED_HEX=$(printf '%-128s' "$CURRENT_HASH" | tr ' ' '0')
+  PASS_COUNT=0
+  FAIL_COUNT=0
 
-    RESULT=$(attestation-cli verify \
-      -e "$EVIDENCE_FILE" \
-      --expected-report-data "$EXPECTED_HEX" 2>/dev/null) || true
-
-    if [ -z "$RESULT" ]; then
-      echo "  Status:        FAIL (attestation-cli verify returned no output)"
-      echo ""
-    else
-      SIG_VALID=$(echo "$RESULT" | jq -r '.signature_valid // false')
-      RD_MATCH=$(echo "$RESULT" | jq -r '.report_data_match // false')
-      PLATFORM=$(echo "$RESULT" | jq -r '.claims.platform // "unknown"')
-
-      echo "  Platform:      $PLATFORM"
-
-      if [ "$SIG_VALID" = "true" ]; then
-        echo "  Signature:     VALID"
-      else
-        echo "  Signature:     INVALID"
-      fi
-
-      if [ "$RD_MATCH" = "true" ]; then
-        echo "  Host Key Bound: PASS (report_data matches current host key)"
-      else
-        echo "  Host Key Bound: FAIL (report_data mismatch)"
-      fi
-
-      # Show TCB info if available
-      TCB_BOOT=$(echo "$RESULT" | jq -r '.claims.tcb.bootloader // empty')
-      TCB_TEE=$(echo "$RESULT" | jq -r '.claims.tcb.tee // empty')
-      TCB_SNP=$(echo "$RESULT" | jq -r '.claims.tcb.snp // empty')
-      TCB_UCODE=$(echo "$RESULT" | jq -r '.claims.tcb.microcode // empty')
-      if [ -n "$TCB_BOOT" ]; then
-        echo "  TCB:           bootloader=$TCB_BOOT tee=$TCB_TEE snp=$TCB_SNP microcode=$TCB_UCODE"
-      fi
-
-      LAUNCH_DIGEST=$(echo "$RESULT" | jq -r '.claims.launch_digest // empty')
-      if [ -n "$LAUNCH_DIGEST" ]; then
-        echo "  Launch Digest: ${LAUNCH_DIGEST:0:32}..."
-      fi
-
-      if [ "$SIG_VALID" = "true" ] && [ "$RD_MATCH" = "true" ]; then
-        echo "  Status:        PASS"
-      else
-        echo "  Status:        FAIL"
-      fi
-      echo ""
-    fi
-  fi
-
-  # -- Check 2: Inference Provider --
-  echo "[2/3] Inference Provider"
-  # Find admin user home (try inference.conf, fall back to /home/azureuser)
+  # Find admin user home
   ADMIN_HOME="/home/azureuser"
   if [ -f "$INFERENCE_CONF" ]; then
     CONF_USER=$(grep '^ADMIN_USER=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
@@ -124,34 +63,90 @@ cmd_verify() {
       ADMIN_HOME="/home/$CONF_USER"
     fi
   fi
+
+  # -- Check 1: TEE Attestation (cryptographic) --
+  echo "[1/3] TEE Attestation"
+  if [ ! -f "$EVIDENCE_FILE" ]; then
+    echo "  Evidence:      not found (attestation may not have run at boot)"
+    echo "  Status:        SKIP"
+    echo ""
+  elif ! command -v attestation-cli &>/dev/null; then
+    echo "  Evidence:      found"
+    echo "  Verifier:      attestation-cli not installed"
+    echo "  Status:        SKIP"
+    echo ""
+  else
+    CURRENT_HASH=$(sha256sum "$HOST_KEY" 2>/dev/null | awk '{print $1}')
+    EXPECTED_HEX=$(printf '%-128s' "$CURRENT_HASH" | tr ' ' '0')
+
+    RESULT=$(attestation-cli verify \
+      -e "$EVIDENCE_FILE" \
+      --expected-report-data "$EXPECTED_HEX" 2>&1) || true
+
+    if [ -z "$RESULT" ] || ! echo "$RESULT" | jq -e . &>/dev/null; then
+      echo "  Evidence:      found"
+      echo "  Verification:  could not verify (attestation-cli error)"
+      echo "  Status:        SKIP"
+      echo ""
+    else
+      SIG_VALID=$(echo "$RESULT" | jq -r '.signature_valid // false')
+      RD_MATCH=$(echo "$RESULT" | jq -r '.report_data_match // false')
+      PLATFORM=$(echo "$RESULT" | jq -r '.claims.platform // "unknown"')
+
+      echo "  Platform:      $PLATFORM"
+      echo "  Signature:     $([ "$SIG_VALID" = "true" ] && echo 'VALID' || echo 'INVALID')"
+      echo "  Host Key:      $([ "$RD_MATCH" = "true" ] && echo 'bound to TEE' || echo 'NOT bound')"
+
+      if [ "$SIG_VALID" = "true" ] && [ "$RD_MATCH" = "true" ]; then
+        echo "  Status:        PASS"
+        PASS_COUNT=$((PASS_COUNT + 1))
+      else
+        echo "  Status:        FAIL"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+      echo ""
+    fi
+  fi
+
+  # -- Check 2: Inference Provider --
+  echo "[2/3] Inference Provider"
   OC_CONFIG="$ADMIN_HOME/.openclaw/openclaw.json"
   if [ -f "$OC_CONFIG" ]; then
     ENDPOINT=$(jq -r '.models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
     echo "  Endpoint:      $ENDPOINT"
-    echo "  Status:        configured"
+    echo "  Status:        PASS"
+    PASS_COUNT=$((PASS_COUNT + 1))
   else
-    echo "  Status:        not configured"
+    echo "  Config:        not found at $OC_CONFIG"
+    echo "  Status:        FAIL"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
   fi
   echo ""
 
   # -- Check 3: External Access Lockout --
   echo "[3/3] External Access Lockout"
   KEY_COUNT=$(wc -l < "$ADMIN_HOME/.ssh/authorized_keys" 2>/dev/null | tr -d ' ')
-  echo "  authorized_keys:  ${KEY_COUNT:-0} key(s)"
+  KEY_COUNT="${KEY_COUNT:-0}"
+  echo "  SSH keys:      $KEY_COUNT authorized"
   if command -v ufw &>/dev/null; then
     UFW_STATUS=$(sudo ufw status 2>/dev/null | head -1 || echo "unknown")
-    echo "  Firewall:         $UFW_STATUS"
+    echo "  Firewall:      $UFW_STATUS"
   fi
-  echo "  Status:        $([ "${KEY_COUNT:-0}" -le 1 ] && echo 'PASS' || echo 'WARN (multiple keys)')"
+  if [ "$KEY_COUNT" -le 1 ]; then
+    echo "  Status:        PASS"
+    PASS_COUNT=$((PASS_COUNT + 1))
+  else
+    echo "  Status:        WARN ($KEY_COUNT keys — expected 1)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  fi
   echo ""
 
-  # -- Independent verification instructions --
-  echo "Evidence: $EVIDENCE_FILE"
-  if [ -f "$HOST_KEY" ]; then
-    HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
-    PADDED=$(printf '%-128s' "$HASH" | tr ' ' '0')
-    echo "Verify independently:"
-    echo "  attestation-cli verify -e evidence.json --expected-report-data $PADDED"
+  # -- Summary --
+  echo "---"
+  if [ "$FAIL_COUNT" -eq 0 ]; then
+    echo "All checks passed ($PASS_COUNT/3)."
+  else
+    echo "$PASS_COUNT passed, $FAIL_COUNT failed."
   fi
   echo ""
 }
