@@ -5,7 +5,7 @@ set -e
 # Downloads privateclaw CLI and attestation-cli to /usr/local/bin/
 
 VERSION="${PRIVATECLAW_VERSION:-v1.0.0}"
-ATTEST_VERSION="${ATTESTATION_CLI_VERSION:-v0.4.0}"
+ATTEST_VERSION="${ATTESTATION_CLI_VERSION:-v0.4.1}"
 
 echo "Installing PrivateClaw CLI ${VERSION}..."
 
