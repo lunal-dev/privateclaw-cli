@@ -98,7 +98,7 @@ cmd_verify() {
   # Find admin user home
   ADMIN_HOME="/home/azureuser"
   if [ -f "$INFERENCE_CONF" ]; then
-    CONF_USER=$(grep -E '^(ADMIN_USERNAME|CVM_ADMIN_USER|ADMIN_USER)=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
+    CONF_USER=$(grep -E '^(VM_USER|ADMIN_USERNAME|CVM_ADMIN_USER|ADMIN_USER)=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
     if [ -n "$CONF_USER" ]; then
       ADMIN_HOME="/home/$CONF_USER"
     fi
@@ -247,7 +247,7 @@ cmd_assign() {
   # Read admin user from inference.conf
   ADMIN_USER="azureuser"
   if [ -f "$INFERENCE_CONF" ]; then
-    CONF_USER=$(grep -E '^(ADMIN_USERNAME|CVM_ADMIN_USER|ADMIN_USER)=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
+    CONF_USER=$(grep -E '^(VM_USER|ADMIN_USERNAME|CVM_ADMIN_USER|ADMIN_USER)=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
     if [ -n "$CONF_USER" ]; then
       ADMIN_USER="$CONF_USER"
     fi
