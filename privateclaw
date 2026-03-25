@@ -1,0 +1,336 @@
+#!/bin/bash
+set -e
+
+# PrivateClaw CLI
+# TEE verification and management for PrivateClaw CVMs.
+# https://github.com/lunal-dev/privateclaw-cli
+
+ATTEST_DIR="/etc/privateclaw"
+EVIDENCE_FILE="$ATTEST_DIR/evidence.json"
+HOST_KEY="/etc/ssh/ssh_host_ed25519_key.pub"
+HOST_KEY_HASH_FILE="$ATTEST_DIR/host_key_hash.txt"
+INFERENCE_CONF="$ATTEST_DIR/inference.conf"
+ASSIGN_LOCK="$ATTEST_DIR/.assigned"
+
+# ---------------------------------------------------------------------------
+# privateclaw attest
+#   Called at boot by cloud-init. Generates attestation evidence binding the
+#   SSH host key to the TEE using attestation-cli.
+# ---------------------------------------------------------------------------
+cmd_attest() {
+  if [ ! -f "$HOST_KEY" ]; then
+    echo "ERROR: No SSH host key found at $HOST_KEY"
+    exit 1
+  fi
+
+  mkdir -p "$ATTEST_DIR"
+
+  HOST_KEY_HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
+  # Zero-pad to 64 bytes (128 hex chars) for the report_data field
+  REPORT_DATA=$(printf '%-128s' "$HOST_KEY_HASH" | tr ' ' '0')
+
+  if ! command -v attestation-cli &>/dev/null; then
+    echo "ERROR: attestation-cli not found in PATH"
+    exit 1
+  fi
+
+  attestation-cli attest \
+    --report-data-hex "$REPORT_DATA" \
+    -o "$EVIDENCE_FILE"
+
+  echo "$HOST_KEY_HASH" > "$HOST_KEY_HASH_FILE"
+  echo "Attestation evidence generated: $EVIDENCE_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# privateclaw verify
+#   User-facing command. Cryptographically verifies TEE attestation, checks
+#   inference provider config, and audits SSH access.
+# ---------------------------------------------------------------------------
+cmd_verify() {
+  echo ""
+  echo "=== PrivateClaw TEE Verification ==="
+  echo ""
+
+  # -- Check 1: TEE Attestation (cryptographic) --
+  echo "[1/3] TEE Attestation"
+  if [ ! -f "$EVIDENCE_FILE" ]; then
+    echo "  Status:        FAIL (no attestation evidence found)"
+    echo "  Expected:      $EVIDENCE_FILE"
+    echo ""
+  elif ! command -v attestation-cli &>/dev/null; then
+    echo "  Status:        FAIL (attestation-cli not installed)"
+    echo ""
+  else
+    CURRENT_HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
+    EXPECTED_HEX=$(printf '%-128s' "$CURRENT_HASH" | tr ' ' '0')
+
+    RESULT=$(attestation-cli verify \
+      -e "$EVIDENCE_FILE" \
+      --expected-report-data "$EXPECTED_HEX" 2>/dev/null) || true
+
+    if [ -z "$RESULT" ]; then
+      echo "  Status:        FAIL (attestation-cli verify returned no output)"
+      echo ""
+    else
+      SIG_VALID=$(echo "$RESULT" | jq -r '.signature_valid // false')
+      RD_MATCH=$(echo "$RESULT" | jq -r '.report_data_match // false')
+      PLATFORM=$(echo "$RESULT" | jq -r '.claims.platform // "unknown"')
+
+      echo "  Platform:      $PLATFORM"
+
+      if [ "$SIG_VALID" = "true" ]; then
+        echo "  Signature:     VALID"
+      else
+        echo "  Signature:     INVALID"
+      fi
+
+      if [ "$RD_MATCH" = "true" ]; then
+        echo "  Host Key Bound: PASS (report_data matches current host key)"
+      else
+        echo "  Host Key Bound: FAIL (report_data mismatch)"
+      fi
+
+      # Show TCB info if available
+      TCB_BOOT=$(echo "$RESULT" | jq -r '.claims.tcb.bootloader // empty')
+      TCB_TEE=$(echo "$RESULT" | jq -r '.claims.tcb.tee // empty')
+      TCB_SNP=$(echo "$RESULT" | jq -r '.claims.tcb.snp // empty')
+      TCB_UCODE=$(echo "$RESULT" | jq -r '.claims.tcb.microcode // empty')
+      if [ -n "$TCB_BOOT" ]; then
+        echo "  TCB:           bootloader=$TCB_BOOT tee=$TCB_TEE snp=$TCB_SNP microcode=$TCB_UCODE"
+      fi
+
+      LAUNCH_DIGEST=$(echo "$RESULT" | jq -r '.claims.launch_digest // empty')
+      if [ -n "$LAUNCH_DIGEST" ]; then
+        echo "  Launch Digest: ${LAUNCH_DIGEST:0:32}..."
+      fi
+
+      if [ "$SIG_VALID" = "true" ] && [ "$RD_MATCH" = "true" ]; then
+        echo "  Status:        PASS"
+      else
+        echo "  Status:        FAIL"
+      fi
+      echo ""
+    fi
+  fi
+
+  # -- Check 2: Inference Provider --
+  echo "[2/3] Inference Provider"
+  # Find admin user home (try inference.conf, fall back to /home/azureuser)
+  ADMIN_HOME="/home/azureuser"
+  if [ -f "$INFERENCE_CONF" ]; then
+    CONF_USER=$(grep '^ADMIN_USER=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
+    if [ -n "$CONF_USER" ]; then
+      ADMIN_HOME="/home/$CONF_USER"
+    fi
+  fi
+  OC_CONFIG="$ADMIN_HOME/.openclaw/openclaw.json"
+  if [ -f "$OC_CONFIG" ]; then
+    ENDPOINT=$(jq -r '.models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
+    echo "  Endpoint:      $ENDPOINT"
+    echo "  Status:        configured"
+  else
+    echo "  Status:        not configured"
+  fi
+  echo ""
+
+  # -- Check 3: External Access Lockout --
+  echo "[3/3] External Access Lockout"
+  KEY_COUNT=$(wc -l < "$ADMIN_HOME/.ssh/authorized_keys" 2>/dev/null | tr -d ' ')
+  echo "  authorized_keys:  ${KEY_COUNT:-0} key(s)"
+  if command -v ufw &>/dev/null; then
+    UFW_STATUS=$(sudo ufw status 2>/dev/null | head -1 || echo "unknown")
+    echo "  Firewall:         $UFW_STATUS"
+  fi
+  echo "  Status:        $([ "${KEY_COUNT:-0}" -le 1 ] && echo 'PASS' || echo 'WARN (multiple keys)')"
+  echo ""
+
+  # -- Independent verification instructions --
+  echo "Evidence: $EVIDENCE_FILE"
+  if [ -f "$HOST_KEY" ]; then
+    HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
+    PADDED=$(printf '%-128s' "$HASH" | tr ' ' '0')
+    echo "Verify independently:"
+    echo "  attestation-cli verify -e evidence.json --expected-report-data $PADDED"
+  fi
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# privateclaw assign
+#   Called by systemd timer. Polls IMDS userData and applies user-specific
+#   configuration (SSH key, OpenClaw, MOTD, Caddy TLS).
+# ---------------------------------------------------------------------------
+cmd_assign() {
+  if [ -f "$ASSIGN_LOCK" ]; then
+    echo "Already assigned, skipping"
+    exit 0
+  fi
+
+  # Read admin user from inference.conf
+  ADMIN_USER="azureuser"
+  if [ -f "$INFERENCE_CONF" ]; then
+    CONF_USER=$(grep '^ADMIN_USER=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
+    if [ -n "$CONF_USER" ]; then
+      ADMIN_USER="$CONF_USER"
+    fi
+  fi
+
+  USERDATA=$(curl -s -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/userData?api-version=2021-01-01&format=text" 2>/dev/null || echo "")
+  if [ -z "$USERDATA" ] || [ "$USERDATA" = "" ]; then
+    echo "No userData found"
+    exit 0
+  fi
+
+  # Decode and parse
+  JSON=$(echo "$USERDATA" | base64 -d 2>/dev/null || echo "")
+  if [ -z "$JSON" ]; then
+    echo "Failed to decode userData"
+    exit 1
+  fi
+
+  SSH_KEY=$(echo "$JSON" | jq -r '.ssh_public_key // empty')
+  INSTANCE_NAME=$(echo "$JSON" | jq -r '.instance_name // empty')
+  LUNAL_ENDPOINT=$(echo "$JSON" | jq -r '.lunal_endpoint // empty')
+  LUNAL_MODEL=$(echo "$JSON" | jq -r '.lunal_model // empty')
+  DNS_ZONE=$(echo "$JSON" | jq -r '.dns_zone // empty')
+  ORCHESTRATOR_IP=$(echo "$JSON" | jq -r '.orchestrator_ip // empty')
+
+  if [ -z "$SSH_KEY" ]; then
+    echo "No SSH key in userData, not yet assigned"
+    exit 0
+  fi
+
+  echo "Processing assignment for $INSTANCE_NAME"
+
+  # 1. Set SSH key (clean slate -- only user's key)
+  mkdir -p /home/$ADMIN_USER/.ssh
+  echo "$SSH_KEY" > /home/$ADMIN_USER/.ssh/authorized_keys
+  chown -R $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh
+  chmod 700 /home/$ADMIN_USER/.ssh
+  chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys
+
+  # 2. Configure OpenClaw with Lunal inference
+  GATEWAY_TOKEN=$(openssl rand -hex 16)
+  sudo -u $ADMIN_USER mkdir -p /home/$ADMIN_USER/.openclaw
+  cat > /home/$ADMIN_USER/.openclaw/openclaw.json << OCEOF
+  {
+    "gateway": {
+      "mode": "local",
+      "bind": "loopback",
+      "auth": {
+        "mode": "token",
+        "token": "$GATEWAY_TOKEN"
+      }
+    },
+    "models": {
+      "providers": {
+        "lunal": {
+          "api": "openai-completions",
+          "baseUrl": "${LUNAL_ENDPOINT}/v1",
+          "apiKey": "not-needed",
+          "models": [
+            {
+              "id": "${LUNAL_MODEL}",
+              "name": "${LUNAL_MODEL}",
+              "contextWindow": 32768,
+              "maxTokens": 8192,
+              "reasoning": false,
+              "input": ["text"],
+              "cost": {
+                "input": 0,
+                "output": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "agents": {
+      "defaults": {
+        "model": {
+          "primary": "lunal/${LUNAL_MODEL}"
+        },
+        "heartbeat": {
+          "every": "30m"
+        }
+      }
+    }
+  }
+OCEOF
+  chown $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.openclaw/openclaw.json
+
+  # 3. Repair and start OpenClaw gateway daemon
+  ADMIN_UID=$(id -u $ADMIN_USER)
+  runuser -l $ADMIN_USER -c "export XDG_RUNTIME_DIR=/run/user/$ADMIN_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$ADMIN_UID/bus && openclaw doctor --repair" || true
+  runuser -l $ADMIN_USER -c "export XDG_RUNTIME_DIR=/run/user/$ADMIN_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$ADMIN_UID/bus && systemctl --user restart openclaw-gateway.service" || true
+
+  # 4. Set MOTD
+  CONNECT_HOST="${INSTANCE_NAME}"
+  if [ -n "$DNS_ZONE" ]; then
+    CONNECT_HOST="${INSTANCE_NAME}.${DNS_ZONE}"
+  fi
+  cat > /etc/motd << MOTDEOF
+
+      +----------------------------------------------------------+
+      |                                                          |
+      |  Welcome to PrivateClaw                                  |
+      |  Running in a Trusted Execution Environment (SEV-SNP)    |
+      |  with end-to-end private inference                       |
+      |                                                          |
+      |  Verify your TEE:                                        |
+      |    $ privateclaw verify                                  |
+      |                                                          |
+      |  Connect a messaging provider:                           |
+      |    $ openclaw configure --section channels               |
+      |                                                          |
+      |  Chat in the terminal:                                   |
+      |    $ openclaw tui                                        |
+      |                                                          |
+      +----------------------------------------------------------+
+
+MOTDEOF
+
+  # 5. Configure and start Caddy TLS reverse proxy for OpenClaw gateway
+  printf '%s {\n    reverse_proxy localhost:18789\n}\n' "$CONNECT_HOST" > /etc/caddy/Caddyfile
+  systemctl enable caddy
+  systemctl start caddy
+
+  # 6. Mark as assigned (prevents re-runs)
+  mkdir -p "$ATTEST_DIR"
+  date > "$ASSIGN_LOCK"
+
+  # 7. Notify orchestrator that assignment is complete
+  CALLBACK_URL=$(echo "$JSON" | jq -r '.callback_url // empty')
+  if [ -n "$CALLBACK_URL" ]; then
+    if [ -n "$ORCHESTRATOR_IP" ]; then
+      ufw allow out to "$ORCHESTRATOR_IP" || true
+    fi
+    curl -s -X POST "$CALLBACK_URL" --max-time 10 || true
+    if [ -n "$ORCHESTRATOR_IP" ]; then
+      ufw delete allow out to "$ORCHESTRATOR_IP" || true
+    fi
+  fi
+
+  # 8. Disable assignment watcher -- no longer needed
+  systemctl disable --now privateclaw-assign-watcher.timer || true
+
+  echo "Assignment complete for $INSTANCE_NAME"
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+  attest)  cmd_attest ;;
+  verify)  cmd_verify ;;
+  assign)  cmd_assign ;;
+  *)
+    echo "Usage: privateclaw <command>"
+    echo ""
+    echo "Commands:"
+    echo "  verify    Verify TEE attestation, inference provider, and access lockout"
+    echo "  attest    Generate attestation evidence (run at boot)"
+    echo "  assign    Apply user configuration from IMDS (run by systemd)"
+    ;;
+esac
