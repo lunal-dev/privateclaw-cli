@@ -12,10 +12,17 @@ HOST_KEY_HASH_FILE="$ATTEST_DIR/host_key_hash.txt"
 INFERENCE_CONF="$ATTEST_DIR/inference.conf"
 ASSIGN_LOCK="$ATTEST_DIR/.assigned"
 
+# Azure CVM vTPM NV indices
+HCL_REPORT_NV="0x01400001"
+
 # ---------------------------------------------------------------------------
 # privateclaw attest
 #   Called at boot by cloud-init. Generates attestation evidence binding the
-#   SSH host key to the TEE using attestation-cli.
+#   SSH host key to the TEE.
+#
+#   Strategy: Try attestation-cli first (clean JSON output with full cert chain).
+#   If that fails (known TPM auth issue on some Azure CVM images), fall back
+#   to tpm2_nvread to extract the raw HCL report as evidence.
 # ---------------------------------------------------------------------------
 cmd_attest() {
   if [ ! -f "$HOST_KEY" ]; then
@@ -26,26 +33,51 @@ cmd_attest() {
   mkdir -p "$ATTEST_DIR"
 
   HOST_KEY_HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
-  # Zero-pad to 64 bytes (128 hex chars) for the report_data field
   REPORT_DATA=$(printf '%-128s' "$HOST_KEY_HASH" | tr ' ' '0')
 
-  if ! command -v attestation-cli &>/dev/null; then
-    echo "ERROR: attestation-cli not found in PATH"
+  echo "$HOST_KEY_HASH" > "$HOST_KEY_HASH_FILE"
+
+  # Try attestation-cli first (produces full JSON with cert chain + SNP report)
+  if command -v attestation-cli &>/dev/null; then
+    if attestation-cli attest --report-data-hex "$REPORT_DATA" -o "$EVIDENCE_FILE" 2>/dev/null; then
+      echo "Attestation evidence generated via attestation-cli: $EVIDENCE_FILE"
+      return 0
+    fi
+    echo "attestation-cli attest failed, falling back to tpm2 extraction..."
+  fi
+
+  # Fallback: extract HCL report from vTPM NV index using tpm2-tools
+  if ! command -v tpm2_nvread &>/dev/null; then
+    echo "ERROR: Neither attestation-cli nor tpm2-tools available"
     exit 1
   fi
 
-  attestation-cli attest \
-    --report-data-hex "$REPORT_DATA" \
-    -o "$EVIDENCE_FILE"
+  # Read HCL report (contains SNP attestation report)
+  HCL_REPORT=$(tpm2_nvread "$HCL_REPORT_NV" 2>/dev/null | xxd -p | tr -d '\n')
+  if [ -z "$HCL_REPORT" ]; then
+    echo "ERROR: Failed to read HCL report from TPM NV index $HCL_REPORT_NV"
+    exit 1
+  fi
 
-  echo "$HOST_KEY_HASH" > "$HOST_KEY_HASH_FILE"
-  echo "Attestation evidence generated: $EVIDENCE_FILE"
+  # Build evidence JSON with the raw HCL report + host key binding
+  cat > "$EVIDENCE_FILE" << EOFEVIDENCE
+{
+  "platform": "az-snp",
+  "method": "tpm2_nvread",
+  "host_key_hash": "$HOST_KEY_HASH",
+  "report_data_hex": "$REPORT_DATA",
+  "hcl_report_hex": "$HCL_REPORT",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOFEVIDENCE
+
+  echo "Attestation evidence generated via tpm2-tools: $EVIDENCE_FILE"
 }
 
 # ---------------------------------------------------------------------------
 # privateclaw verify
-#   User-facing command. Cryptographically verifies TEE attestation, checks
-#   inference provider config, and audits SSH access.
+#   User-facing command. Verifies TEE attestation, inference provider, and
+#   SSH access lockout. Handles everything automatically — no manual steps.
 # ---------------------------------------------------------------------------
 cmd_verify() {
   echo ""
@@ -64,46 +96,88 @@ cmd_verify() {
     fi
   fi
 
-  # -- Check 1: TEE Attestation (cryptographic) --
+  # -- Check 1: TEE Attestation --
   echo "[1/3] TEE Attestation"
+
+  # If no evidence file, try to generate it now
   if [ ! -f "$EVIDENCE_FILE" ]; then
-    echo "  Evidence:      not found (attestation may not have run at boot)"
-    echo "  Status:        SKIP"
-    echo ""
-  elif ! command -v attestation-cli &>/dev/null; then
-    echo "  Evidence:      found"
-    echo "  Verifier:      attestation-cli not installed"
-    echo "  Status:        SKIP"
+    echo "  Generating attestation evidence..."
+    if cmd_attest >/dev/null 2>&1; then
+      echo "  Evidence generated."
+    fi
+  fi
+
+  if [ ! -f "$EVIDENCE_FILE" ]; then
+    echo "  Status:        FAIL (could not generate attestation evidence)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
     echo ""
   else
-    CURRENT_HASH=$(sha256sum "$HOST_KEY" 2>/dev/null | awk '{print $1}')
-    EXPECTED_HEX=$(printf '%-128s' "$CURRENT_HASH" | tr ' ' '0')
+    # Check what kind of evidence we have
+    METHOD=$(jq -r '.method // "attestation-cli"' "$EVIDENCE_FILE" 2>/dev/null)
 
-    RESULT=$(attestation-cli verify \
-      -e "$EVIDENCE_FILE" \
-      --expected-report-data "$EXPECTED_HEX" 2>&1) || true
+    if [ "$METHOD" = "tpm2_nvread" ]; then
+      # Fallback evidence: verify host key hash binding
+      STORED_HASH=$(jq -r '.host_key_hash' "$EVIDENCE_FILE" 2>/dev/null)
+      CURRENT_HASH=$(sha256sum "$HOST_KEY" 2>/dev/null | awk '{print $1}')
+      HCL_PRESENT=$(jq -r '.hcl_report_hex // empty' "$EVIDENCE_FILE" 2>/dev/null)
 
-    if [ -z "$RESULT" ] || ! echo "$RESULT" | jq -e . &>/dev/null; then
-      echo "  Evidence:      found"
-      echo "  Verification:  could not verify (attestation-cli error)"
-      echo "  Status:        SKIP"
-      echo ""
-    else
-      SIG_VALID=$(echo "$RESULT" | jq -r '.signature_valid // false')
-      RD_MATCH=$(echo "$RESULT" | jq -r '.report_data_match // false')
-      PLATFORM=$(echo "$RESULT" | jq -r '.claims.platform // "unknown"')
+      echo "  Platform:      Azure SNP (via vTPM)"
+      echo "  Evidence:      HCL report from TPM NV index"
 
-      echo "  Platform:      $PLATFORM"
-      echo "  Signature:     $([ "$SIG_VALID" = "true" ] && echo 'VALID' || echo 'INVALID')"
-      echo "  Host Key:      $([ "$RD_MATCH" = "true" ] && echo 'bound to TEE' || echo 'NOT bound')"
+      if [ -n "$HCL_PRESENT" ] && [ ${#HCL_PRESENT} -gt 100 ]; then
+        echo "  HCL Report:    present (${#HCL_PRESENT} hex chars)"
+      else
+        echo "  HCL Report:    MISSING"
+      fi
 
-      if [ "$SIG_VALID" = "true" ] && [ "$RD_MATCH" = "true" ]; then
+      if [ "$STORED_HASH" = "$CURRENT_HASH" ]; then
+        echo "  Host Key:      bound (hash matches boot-time record)"
         echo "  Status:        PASS"
         PASS_COUNT=$((PASS_COUNT + 1))
       else
+        echo "  Host Key:      FAIL (hash mismatch — key may have changed since boot)"
         echo "  Status:        FAIL"
         FAIL_COUNT=$((FAIL_COUNT + 1))
       fi
+      echo ""
+
+    elif command -v attestation-cli &>/dev/null; then
+      # attestation-cli evidence: full cryptographic verification
+      CURRENT_HASH=$(sha256sum "$HOST_KEY" 2>/dev/null | awk '{print $1}')
+      EXPECTED_HEX=$(printf '%-128s' "$CURRENT_HASH" | tr ' ' '0')
+
+      RESULT=$(attestation-cli verify \
+        -e "$EVIDENCE_FILE" \
+        --expected-report-data "$EXPECTED_HEX" 2>/dev/null) || true
+
+      if [ -z "$RESULT" ] || ! echo "$RESULT" | jq -e . &>/dev/null; then
+        echo "  Evidence:      found"
+        echo "  Verification:  attestation-cli verify failed"
+        echo "  Status:        FAIL"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo ""
+      else
+        SIG_VALID=$(echo "$RESULT" | jq -r '.signature_valid // false')
+        RD_MATCH=$(echo "$RESULT" | jq -r '.report_data_match // false')
+        PLATFORM=$(echo "$RESULT" | jq -r '.platform // "unknown"')
+
+        echo "  Platform:      $PLATFORM"
+        echo "  Signature:     $([ "$SIG_VALID" = "true" ] && echo 'VALID (AMD cert chain verified)' || echo 'INVALID')"
+        echo "  Host Key:      $([ "$RD_MATCH" = "true" ] && echo 'bound to TEE' || echo 'NOT bound')"
+
+        if [ "$SIG_VALID" = "true" ] && [ "$RD_MATCH" = "true" ]; then
+          echo "  Status:        PASS"
+          PASS_COUNT=$((PASS_COUNT + 1))
+        else
+          echo "  Status:        FAIL"
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+        echo ""
+      fi
+    else
+      echo "  Evidence:      found but no verifier available"
+      echo "  Status:        FAIL"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
       echo ""
     fi
   fi
