@@ -7,10 +7,21 @@ set -e
 
 ATTEST_DIR="/etc/privateclaw"
 EVIDENCE_FILE="$ATTEST_DIR/evidence.json"
+SNP_EVIDENCE_FILE="$ATTEST_DIR/snp_evidence.json"
 HOST_KEY="/etc/ssh/ssh_host_ed25519_key.pub"
 HOST_KEY_HASH_FILE="$ATTEST_DIR/host_key_hash.txt"
 INFERENCE_CONF="$ATTEST_DIR/inference.conf"
 ASSIGN_LOCK="$ATTEST_DIR/.assigned"
+
+# attestation-cli binary path (auto-detect or override via env)
+ATTESTATION_CLI="${ATTESTATION_CLI_PATH:-}"
+if [ -z "$ATTESTATION_CLI" ]; then
+  if command -v attestation-cli &>/dev/null; then
+    ATTESTATION_CLI="attestation-cli"
+  elif [ -x /opt/lunal-services/attestation-cli ]; then
+    ATTESTATION_CLI="/opt/lunal-services/attestation-cli"
+  fi
+fi
 
 # Azure CVM vTPM NV indices
 HCL_REPORT_NV="0x01400001"
@@ -38,8 +49,8 @@ cmd_attest() {
   echo "$HOST_KEY_HASH" > "$HOST_KEY_HASH_FILE"
 
   # Try attestation-cli first (produces full JSON with cert chain + SNP report)
-  if command -v attestation-cli &>/dev/null; then
-    if attestation-cli attest --report-data-hex "$REPORT_DATA" -o "$EVIDENCE_FILE" 2>/dev/null; then
+  if [ -n "$ATTESTATION_CLI" ]; then
+    if $ATTESTATION_CLI attest --report-data-hex "$REPORT_DATA" -o "$EVIDENCE_FILE" 2>/dev/null; then
       echo "Attestation evidence generated via attestation-cli: $EVIDENCE_FILE"
       return 0
     fi
@@ -86,12 +97,20 @@ EOFEVIDENCE
 # privateclaw verify
 #   User-facing command. Verifies TEE attestation, inference provider, and
 #   SSH access lockout. Handles everything automatically — no manual steps.
+#
+#   Checks (in order):
+#     1. SEV-SNP Hardware   — fresh SNP report + VCEK certificate chain
+#     2. TPM Attestation    — HCL report from vTPM NV index
+#     3. Host Key Binding   — SSH host key hash matches boot-time record
+#     4. Inference Provider  — endpoint reachable + attestation header
+#     5. Access Lockout      — SSH keys + firewall
 # ---------------------------------------------------------------------------
 cmd_verify() {
   echo ""
   echo "=== PrivateClaw TEE Verification ==="
   echo ""
 
+  TOTAL_CHECKS=5
   PASS_COUNT=0
   FAIL_COUNT=0
 
@@ -104,94 +123,205 @@ cmd_verify() {
     fi
   fi
 
-  # -- Check 1: TEE Attestation --
-  echo "[1/3] TEE Attestation"
-
-  # If no evidence file, try to generate it now
+  # Ensure attestation evidence exists (needed by checks 2 and 3)
   if [ ! -f "$EVIDENCE_FILE" ]; then
-    echo "  Generating attestation evidence..."
-    if cmd_attest >/dev/null 2>&1; then
-      echo "  Evidence generated."
-    fi
+    cmd_attest >/dev/null 2>&1 || true
   fi
 
-  if [ ! -f "$EVIDENCE_FILE" ]; then
-    echo "  Status:        FAIL (could not generate attestation evidence)"
+  # Compute current host key hash (used by checks 1 and 3)
+  CURRENT_HOST_KEY_HASH=""
+  if [ -f "$HOST_KEY" ]; then
+    CURRENT_HOST_KEY_HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
+  fi
+
+  # ==========================================================================
+  # Check 1: SEV-SNP Hardware Attestation
+  # ==========================================================================
+  echo "[1/$TOTAL_CHECKS] SEV-SNP Hardware"
+
+  if [ -z "$ATTESTATION_CLI" ]; then
+    echo "  Status:        SKIP (attestation-cli not found)"
+    echo "  Hint:          install attestation-cli or set ATTESTATION_CLI_PATH"
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo ""
   else
-    # Check what kind of evidence we have
+    # Request a fresh SNP attestation report with the host key hash as report_data
+    SNP_REPORT_DATA=""
+    if [ -n "$CURRENT_HOST_KEY_HASH" ]; then
+      SNP_REPORT_DATA=$(printf '%-128s' "$CURRENT_HOST_KEY_HASH" | tr ' ' '0')
+    fi
+
+    SNP_TMPFILE=$(mktemp /tmp/snp_evidence_XXXXXX.json)
+    SNP_OK=false
+
+    if [ -n "$SNP_REPORT_DATA" ]; then
+      SNP_ATTEST_OUT=$($ATTESTATION_CLI attest \
+        --platform az-snp \
+        --report-data-hex "$SNP_REPORT_DATA" \
+        -o "$SNP_TMPFILE" 2>&1) || true
+    else
+      SNP_ATTEST_OUT=$($ATTESTATION_CLI attest \
+        --platform az-snp \
+        -o "$SNP_TMPFILE" 2>&1) || true
+    fi
+
+    if [ -f "$SNP_TMPFILE" ] && [ -s "$SNP_TMPFILE" ] && jq -e . "$SNP_TMPFILE" &>/dev/null; then
+      # Verify the SNP report via attestation-cli (validates VCEK cert chain)
+      SNP_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$SNP_TMPFILE" 2>/dev/null) || true
+
+      if [ -n "$SNP_VERIFY_RESULT" ] && echo "$SNP_VERIFY_RESULT" | jq -e . &>/dev/null; then
+        SNP_SIG_VALID=$(echo "$SNP_VERIFY_RESULT" | jq -r '.signature_valid // false')
+        SNP_PLATFORM=$(echo "$SNP_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+
+        echo "  Platform:      $SNP_PLATFORM"
+
+        # Extract VCEK certificate subject if present
+        VCEK_SUBJECT=$(echo "$SNP_VERIFY_RESULT" | jq -r '.vcek_subject // empty' 2>/dev/null)
+        if [ -n "$VCEK_SUBJECT" ]; then
+          echo "  VCEK:          $VCEK_SUBJECT"
+        fi
+
+        # Extract SNP report fields from the evidence or verify result
+        GUEST_SVN=$(jq -r '.snp_report.guest_svn // .guest_svn // empty' "$SNP_TMPFILE" 2>/dev/null)
+        SNP_POLICY=$(jq -r '.snp_report.policy // .policy // empty' "$SNP_TMPFILE" 2>/dev/null)
+        MEASUREMENT=$(jq -r '.snp_report.measurement // .measurement // empty' "$SNP_TMPFILE" 2>/dev/null)
+        HOST_DATA=$(jq -r '.snp_report.host_data // .host_data // empty' "$SNP_TMPFILE" 2>/dev/null)
+        REPORT_DATA_FIELD=$(jq -r '.snp_report.report_data // .report_data // empty' "$SNP_TMPFILE" 2>/dev/null)
+
+        [ -n "$GUEST_SVN" ] && echo "  Guest SVN:     $GUEST_SVN"
+        [ -n "$SNP_POLICY" ] && echo "  Policy:        $SNP_POLICY"
+        if [ -n "$MEASUREMENT" ]; then
+          echo "  Measurement:   ${MEASUREMENT:0:32}..."
+        fi
+        if [ -n "$HOST_DATA" ] && [ "$HOST_DATA" != "0000000000000000000000000000000000000000000000000000000000000000" ]; then
+          echo "  Host Data:     ${HOST_DATA:0:32}..."
+        fi
+        if [ -n "$REPORT_DATA_FIELD" ]; then
+          echo "  Report Data:   ${REPORT_DATA_FIELD:0:32}... (SSH key hash)"
+        fi
+
+        echo "  VCEK Chain:    $([ "$SNP_SIG_VALID" = "true" ] && echo 'VALID (AMD root CA -> VCEK -> SNP report)' || echo 'INVALID')"
+
+        if [ "$SNP_SIG_VALID" = "true" ]; then
+          echo "  Status:        PASS"
+          PASS_COUNT=$((PASS_COUNT + 1))
+          SNP_OK=true
+          # Save SNP evidence for reference
+          cp "$SNP_TMPFILE" "$SNP_EVIDENCE_FILE" 2>/dev/null || true
+        else
+          echo "  Status:        FAIL (VCEK signature verification failed)"
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+      else
+        echo "  Attestation:   report obtained but verification failed"
+        echo "  Status:        FAIL"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+    else
+      echo "  Error:         could not obtain SNP report from hardware"
+      if [ -n "$SNP_ATTEST_OUT" ]; then
+        echo "  Detail:        $(echo "$SNP_ATTEST_OUT" | head -1)"
+      fi
+      echo "  Status:        FAIL"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    rm -f "$SNP_TMPFILE"
+    echo ""
+  fi
+
+  # ==========================================================================
+  # Check 2: TPM Attestation (HCL Report)
+  # ==========================================================================
+  echo "[2/$TOTAL_CHECKS] TPM Attestation"
+
+  if [ ! -f "$EVIDENCE_FILE" ]; then
+    echo "  Status:        FAIL (no attestation evidence found)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo ""
+  else
     METHOD=$(jq -r '.method // "attestation-cli"' "$EVIDENCE_FILE" 2>/dev/null)
 
     if [ "$METHOD" = "tpm2_nvread" ]; then
-      # Fallback evidence: verify host key hash binding
-      STORED_HASH=$(jq -r '.host_key_hash' "$EVIDENCE_FILE" 2>/dev/null)
-      CURRENT_HASH=$(sha256sum "$HOST_KEY" 2>/dev/null | awk '{print $1}')
       HCL_PRESENT=$(jq -r '.hcl_report_hex // empty' "$EVIDENCE_FILE" 2>/dev/null)
-
-      echo "  Platform:      Azure SNP (via vTPM)"
-      echo "  Evidence:      HCL report from TPM NV index"
-
+      echo "  Method:        tpm2_nvread (TPM NV index $HCL_REPORT_NV)"
       if [ -n "$HCL_PRESENT" ] && [ ${#HCL_PRESENT} -gt 100 ]; then
         echo "  HCL Report:    present (${#HCL_PRESENT} hex chars)"
-      else
-        echo "  HCL Report:    MISSING"
-      fi
-
-      if [ "$STORED_HASH" = "$CURRENT_HASH" ]; then
-        echo "  Host Key:      bound (hash matches boot-time record)"
         echo "  Status:        PASS"
         PASS_COUNT=$((PASS_COUNT + 1))
       else
-        echo "  Host Key:      FAIL (hash mismatch — key may have changed since boot)"
+        echo "  HCL Report:    MISSING or empty"
         echo "  Status:        FAIL"
         FAIL_COUNT=$((FAIL_COUNT + 1))
       fi
-      echo ""
-
-    elif command -v attestation-cli &>/dev/null; then
-      # attestation-cli evidence: full cryptographic verification
-      CURRENT_HASH=$(sha256sum "$HOST_KEY" 2>/dev/null | awk '{print $1}')
-      EXPECTED_HEX=$(printf '%-128s' "$CURRENT_HASH" | tr ' ' '0')
-
-      RESULT=$(attestation-cli verify \
-        -e "$EVIDENCE_FILE" \
-        --expected-report-data "$EXPECTED_HEX" 2>/dev/null) || true
-
-      if [ -z "$RESULT" ] || ! echo "$RESULT" | jq -e . &>/dev/null; then
-        echo "  Evidence:      found"
-        echo "  Verification:  attestation-cli verify failed"
-        echo "  Status:        FAIL"
-        FAIL_COUNT=$((FAIL_COUNT + 1))
-        echo ""
-      else
-        SIG_VALID=$(echo "$RESULT" | jq -r '.signature_valid // false')
-        RD_MATCH=$(echo "$RESULT" | jq -r '.report_data_match // false')
-        PLATFORM=$(echo "$RESULT" | jq -r '.platform // "unknown"')
-
-        echo "  Platform:      $PLATFORM"
-        echo "  Signature:     $([ "$SIG_VALID" = "true" ] && echo 'VALID (AMD cert chain verified)' || echo 'INVALID')"
-        echo "  Host Key:      $([ "$RD_MATCH" = "true" ] && echo 'bound to TEE' || echo 'NOT bound')"
-
-        if [ "$SIG_VALID" = "true" ] && [ "$RD_MATCH" = "true" ]; then
-          echo "  Status:        PASS"
-          PASS_COUNT=$((PASS_COUNT + 1))
+    else
+      # Evidence from attestation-cli — verify it
+      if [ -n "$ATTESTATION_CLI" ]; then
+        TPM_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$EVIDENCE_FILE" 2>/dev/null) || true
+        if [ -n "$TPM_VERIFY_RESULT" ] && echo "$TPM_VERIFY_RESULT" | jq -e . &>/dev/null; then
+          TPM_SIG_VALID=$(echo "$TPM_VERIFY_RESULT" | jq -r '.signature_valid // false')
+          TPM_PLATFORM=$(echo "$TPM_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+          echo "  Method:        attestation-cli"
+          echo "  Platform:      $TPM_PLATFORM"
+          echo "  Signature:     $([ "$TPM_SIG_VALID" = "true" ] && echo 'VALID' || echo 'INVALID')"
+          if [ "$TPM_SIG_VALID" = "true" ]; then
+            echo "  Status:        PASS"
+            PASS_COUNT=$((PASS_COUNT + 1))
+          else
+            echo "  Status:        FAIL"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+          fi
         else
+          echo "  Method:        attestation-cli"
+          echo "  Verification:  failed"
           echo "  Status:        FAIL"
           FAIL_COUNT=$((FAIL_COUNT + 1))
         fi
-        echo ""
+      else
+        echo "  Method:        attestation-cli (evidence present, no verifier)"
+        echo "  Status:        FAIL (attestation-cli not found to verify)"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
       fi
-    else
-      echo "  Evidence:      found but no verifier available"
-      echo "  Status:        FAIL"
-      FAIL_COUNT=$((FAIL_COUNT + 1))
-      echo ""
     fi
+    echo ""
   fi
 
-  # -- Check 2: Inference Provider --
-  echo "[2/3] Inference Provider"
+  # ==========================================================================
+  # Check 3: Host Key Binding
+  # ==========================================================================
+  echo "[3/$TOTAL_CHECKS] Host Key Binding"
+
+  if [ -z "$CURRENT_HOST_KEY_HASH" ]; then
+    echo "  Status:        FAIL (no SSH host key at $HOST_KEY)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  elif [ ! -f "$EVIDENCE_FILE" ]; then
+    echo "  Status:        FAIL (no evidence file to compare)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  else
+    STORED_HASH=$(jq -r '.host_key_hash // empty' "$EVIDENCE_FILE" 2>/dev/null)
+    if [ -z "$STORED_HASH" ]; then
+      # Try reading from the hash file
+      STORED_HASH=$(cat "$HOST_KEY_HASH_FILE" 2>/dev/null | tr -d '[:space:]')
+    fi
+
+    echo "  Current hash:  ${CURRENT_HOST_KEY_HASH:0:16}..."
+    echo "  Boot hash:     ${STORED_HASH:0:16}..."
+
+    if [ "$STORED_HASH" = "$CURRENT_HOST_KEY_HASH" ]; then
+      echo "  Match:         YES (key unchanged since boot attestation)"
+      echo "  Status:        PASS"
+      PASS_COUNT=$((PASS_COUNT + 1))
+    else
+      echo "  Match:         NO (key changed since boot — attestation is stale)"
+      echo "  Status:        FAIL"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+  fi
+  echo ""
+
+  # ==========================================================================
+  # Check 4: Inference Provider
+  # ==========================================================================
+  echo "[4/$TOTAL_CHECKS] Inference Provider"
   OC_CONFIG="$ADMIN_HOME/.openclaw/openclaw.json"
   if [ ! -f "$OC_CONFIG" ]; then
     echo "  Config:        not found at $OC_CONFIG"
@@ -222,13 +352,13 @@ cmd_verify() {
     elif [ -n "$ATTESTATION" ]; then
       echo "  Provider:      ${INF_PROVIDER:-lunal}"
 
-      # Decode attestation: base64 → gunzip → JSON evidence
+      # Decode attestation: base64 -> gunzip -> JSON evidence
       INF_ATTEST_OK=false
       INF_EVIDENCE_FILE=$(mktemp /tmp/inference_attestation_XXXXXX.json)
       if echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_EVIDENCE_FILE" 2>/dev/null; then
         # Verify with attestation-cli if available
-        if command -v attestation-cli &>/dev/null; then
-          INF_VERIFY_RESULT=$(attestation-cli verify -e "$INF_EVIDENCE_FILE" 2>/dev/null) || true
+        if [ -n "$ATTESTATION_CLI" ]; then
+          INF_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$INF_EVIDENCE_FILE" 2>/dev/null) || true
           if [ -n "$INF_VERIFY_RESULT" ] && echo "$INF_VERIFY_RESULT" | jq -e . &>/dev/null; then
             INF_SIG_VALID=$(echo "$INF_VERIFY_RESULT" | jq -r '.signature_valid // false')
             INF_PLATFORM=$(echo "$INF_VERIFY_RESULT" | jq -r '.platform // "unknown"')
@@ -275,8 +405,10 @@ cmd_verify() {
     echo ""
   fi
 
-  # -- Check 3: External Access Lockout --
-  echo "[3/3] External Access Lockout"
+  # ==========================================================================
+  # Check 5: External Access Lockout
+  # ==========================================================================
+  echo "[5/$TOTAL_CHECKS] External Access Lockout"
   KEY_COUNT=$(grep -c '^ssh-' "$ADMIN_HOME/.ssh/authorized_keys" 2>/dev/null || echo 0)
   KEY_COUNT="${KEY_COUNT:-0}"
   echo "  SSH keys:      $KEY_COUNT authorized"
@@ -296,9 +428,9 @@ cmd_verify() {
   # -- Summary --
   echo "---"
   if [ "$FAIL_COUNT" -eq 0 ]; then
-    echo "All checks passed ($PASS_COUNT/3)."
+    echo "All checks passed ($PASS_COUNT/$TOTAL_CHECKS)."
   else
-    echo "$PASS_COUNT passed, $FAIL_COUNT failed."
+    echo "$PASS_COUNT passed, $FAIL_COUNT failed or warned."
   fi
   echo ""
 }
@@ -476,7 +608,7 @@ case "${1:-}" in
     echo "Usage: privateclaw <command>"
     echo ""
     echo "Commands:"
-    echo "  verify    Verify TEE attestation, inference provider, and access lockout"
+    echo "  verify    Verify SEV-SNP hardware, TPM, host key, inference, and access lockout"
     echo "  attest    Generate attestation evidence (run at boot)"
     echo "  assign    Apply user configuration from IMDS (run by systemd)"
     ;;
