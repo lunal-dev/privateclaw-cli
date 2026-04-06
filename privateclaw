@@ -165,6 +165,33 @@ cmd_verify() {
         -o "$SNP_TMPFILE" 2>&1) || true
     fi
 
+    # Fallback: TPM device (/dev/tpmrm0) is owned by root:tss. If the current user
+    # is not in the tss group, the attest call fails with "vtpm::get_report failed:
+    # tpm error". Retry under sudo if available — most CVM admin users have
+    # passwordless sudo configured.
+    if { [ ! -s "$SNP_TMPFILE" ] || ! jq -e . "$SNP_TMPFILE" &>/dev/null; } && command -v sudo &>/dev/null; then
+      if echo "$SNP_ATTEST_OUT" | grep -qi "tpm error\|permission denied\|EACCES\|get_report failed" || ! [ -s "$SNP_TMPFILE" ]; then
+        if [ -n "$SNP_REPORT_DATA" ]; then
+          SNP_ATTEST_OUT=$(sudo -n "$ATTESTATION_CLI" attest \
+            --platform az-snp \
+            --report-data-hex "$SNP_REPORT_DATA" \
+            -o "$SNP_TMPFILE" 2>&1) || true
+        else
+          SNP_ATTEST_OUT=$(sudo -n "$ATTESTATION_CLI" attest \
+            --platform az-snp \
+            -o "$SNP_TMPFILE" 2>&1) || true
+        fi
+        # Fix ownership so subsequent jq/cp work as the current user
+        sudo -n chown "$(id -u):$(id -g)" "$SNP_TMPFILE" 2>/dev/null || true
+      fi
+    fi
+
+    # If still failing, give a helpful hint about tss group membership
+    if { [ ! -s "$SNP_TMPFILE" ] || ! jq -e . "$SNP_TMPFILE" &>/dev/null; } \
+        && echo "$SNP_ATTEST_OUT" | grep -qi "tpm error\|permission denied\|EACCES\|get_report failed"; then
+      SNP_ATTEST_OUT="TPM access denied — add this user to the 'tss' group: sudo usermod -aG tss \$USER (then re-login). Detail: $SNP_ATTEST_OUT"
+    fi
+
     if [ -f "$SNP_TMPFILE" ] && [ -s "$SNP_TMPFILE" ] && jq -e . "$SNP_TMPFILE" &>/dev/null; then
       # Verify the SNP report via attestation-cli (validates VCEK cert chain)
       SNP_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$SNP_TMPFILE" 2>/dev/null) || true
@@ -335,9 +362,11 @@ cmd_verify() {
     # Make a minimal request to the inference endpoint and capture response headers
     INF_HEADERS=""
     if [ "$ENDPOINT" != "not configured" ]; then
-      INF_HEADERS=$(curl -sI -X POST "$ENDPOINT/chat/completions" \
-        -H "Content-Type: application/json" \
-        -d '{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+      # NOTE: Do NOT use `curl -I -X POST` — `-I` forces HEAD which conflicts
+      # with `-X POST` and curl bails out producing no output. Use `-D -` to
+      # dump headers from a real GET request instead. The /v1/models endpoint
+      # returns the same Attestation-Report header as /chat/completions.
+      INF_HEADERS=$(curl -s -D - -o /dev/null "$ENDPOINT/models" \
         --max-time 10 2>/dev/null) || true
     fi
 
