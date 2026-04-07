@@ -165,22 +165,27 @@ cmd_verify() {
         -o "$SNP_TMPFILE" 2>&1) || true
     fi
 
-    # Fallback: TPM device (/dev/tpmrm0) is owned by root:tss. If the current user
+    # Fallback 1: Some Azure CVM images fail Esys_Quote when --report-data-hex
+    # is provided (TPM owner auth issue, not a permissions problem — affects
+    # root and non-root alike). Retry without --report-data-hex; the host key
+    # binding is independently verified in Check 3.
+    if { [ ! -s "$SNP_TMPFILE" ] || ! jq -e . "$SNP_TMPFILE" &>/dev/null; } && [ -n "$SNP_REPORT_DATA" ]; then
+      if echo "$SNP_ATTEST_OUT" | grep -qi "Esys_Quote\|get_quote failed\|tpm error"; then
+        SNP_ATTEST_OUT=$($ATTESTATION_CLI attest \
+          --platform az-snp \
+          -o "$SNP_TMPFILE" 2>&1) || true
+      fi
+    fi
+
+    # Fallback 2: TPM device (/dev/tpmrm0) is owned by root:tss. If the current user
     # is not in the tss group, the attest call fails with "vtpm::get_report failed:
     # tpm error". Retry under sudo if available — most CVM admin users have
     # passwordless sudo configured.
     if { [ ! -s "$SNP_TMPFILE" ] || ! jq -e . "$SNP_TMPFILE" &>/dev/null; } && command -v sudo &>/dev/null; then
       if echo "$SNP_ATTEST_OUT" | grep -qi "tpm error\|permission denied\|EACCES\|get_report failed" || ! [ -s "$SNP_TMPFILE" ]; then
-        if [ -n "$SNP_REPORT_DATA" ]; then
-          SNP_ATTEST_OUT=$(sudo -n "$ATTESTATION_CLI" attest \
-            --platform az-snp \
-            --report-data-hex "$SNP_REPORT_DATA" \
-            -o "$SNP_TMPFILE" 2>&1) || true
-        else
-          SNP_ATTEST_OUT=$(sudo -n "$ATTESTATION_CLI" attest \
-            --platform az-snp \
-            -o "$SNP_TMPFILE" 2>&1) || true
-        fi
+        SNP_ATTEST_OUT=$(sudo -n "$ATTESTATION_CLI" attest \
+          --platform az-snp \
+          -o "$SNP_TMPFILE" 2>&1) || true
         # Fix ownership so subsequent jq/cp work as the current user
         sudo -n chown "$(id -u):$(id -g)" "$SNP_TMPFILE" 2>/dev/null || true
       fi
