@@ -396,9 +396,13 @@ cmd_verify() {
       INF_ATTEST_OK=false
       if [ -n "$ATTESTATION" ]; then
         INF_EVIDENCE_FILE=$(mktemp /tmp/inference_attestation_XXXXXX.json)
+        INF_BIN_FILE=$(mktemp /tmp/inference_bin_XXXXXX)
         INF_DECODED=false
-        # Try 1: base64+gzip (backward compat with old Lunal inline attestation)
-        if echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_EVIDENCE_FILE" 2>/dev/null && jq -e . "$INF_EVIDENCE_FILE" &>/dev/null 2>&1; then
+        # Decode base64+gzip into a raw binary file first (shared by Try 1 and Try 3)
+        echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_BIN_FILE" 2>/dev/null || true
+        # Try 1: base64+gzip → valid JSON evidence
+        if [ -s "$INF_BIN_FILE" ] && jq -e . "$INF_BIN_FILE" &>/dev/null 2>&1; then
+          cp "$INF_BIN_FILE" "$INF_EVIDENCE_FILE"
           INF_DECODED=true
         fi
         # Try 2: raw JSON (new attestation-service sidecar format)
@@ -409,8 +413,50 @@ cmd_verify() {
             INF_DECODED=true
           fi
         fi
-        if [ "$INF_DECODED" = "true" ]; then
-          # Verify with attestation-cli if available
+        # Try 3: base64+gzip → raw HCLA binary (Azure HCL Attestation Report)
+        # Format: 8-byte header + "HCLA" magic (hex 48434c41) + SNP report + embedded PEM certs.
+        # Lunal's tee-proxy sends this format directly — NOT the attestation-service JSON format.
+        # We extract the embedded VCEK/ASK/ARK cert chain and verify with openssl.
+        if [ "$INF_DECODED" = "false" ] && [ -s "$INF_BIN_FILE" ]; then
+          HCLA_MAGIC=$(dd if="$INF_BIN_FILE" bs=1 skip=8 count=4 2>/dev/null | xxd -p 2>/dev/null || true)
+          if [ "$HCLA_MAGIC" = "48434c41" ]; then
+            INF_VCEK_PEM=$(mktemp /tmp/inf_vcek_XXXXXX.pem)
+            INF_ASK_PEM=$(mktemp /tmp/inf_ask_XXXXXX.pem)
+            INF_ARK_PEM=$(mktemp /tmp/inf_ark_XXXXXX.pem)
+            INF_CHAIN_PEM=$(mktemp /tmp/inf_chain_XXXXXX.pem)
+            # Extract all PEM certificates from the binary blob
+            python3 - "$INF_BIN_FILE" "$INF_VCEK_PEM" "$INF_ASK_PEM" "$INF_ARK_PEM" <<'PYEOF'
+import sys, re
+bin_path, vcek_out, ask_out, ark_out = sys.argv[1:]
+with open(bin_path, "rb") as f:
+    data = f.read()
+pem_re = re.compile(b"-----BEGIN CERTIFICATE-----[\\s\\S]+?-----END CERTIFICATE-----")
+certs = pem_re.findall(data)
+outs = [vcek_out, ask_out, ark_out]
+for i, cert in enumerate(certs[:3]):
+    with open(outs[i], "wb") as out:
+        out.write(cert + b"\n")
+PYEOF
+            # Build chain: intermediate(ASK) + root(ARK), verify VCEK against it
+            if [ -s "$INF_VCEK_PEM" ] && [ -s "$INF_ASK_PEM" ] && [ -s "$INF_ARK_PEM" ]; then
+              cat "$INF_ASK_PEM" "$INF_ARK_PEM" > "$INF_CHAIN_PEM"
+              VCEK_VERIFY=$(openssl verify -CAfile "$INF_CHAIN_PEM" "$INF_VCEK_PEM" 2>&1) || true
+              if echo "$VCEK_VERIFY" | grep -q ": OK"; then
+                echo "  Lunal Upstream VCEK Chain:  VALID (AMD root CA -> ASK -> VCEK)"
+                INF_ATTEST_OK=true
+                INF_DECODED=true
+              else
+                echo "  Lunal Upstream Attestation: HCLA binary present but cert chain invalid"
+                echo "    openssl: $VCEK_VERIFY"
+              fi
+            else
+              echo "  Lunal Upstream Attestation: HCLA binary present but could not extract PEM certs"
+            fi
+            rm -f "$INF_VCEK_PEM" "$INF_ASK_PEM" "$INF_ARK_PEM" "$INF_CHAIN_PEM"
+          fi
+        fi
+        if [ "$INF_DECODED" = "true" ] && [ "$INF_ATTEST_OK" = "false" ]; then
+          # JSON evidence path: Verify with attestation-cli if available
           if [ -n "$ATTESTATION_CLI" ]; then
             INF_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$INF_EVIDENCE_FILE" 2>/dev/null) || true
             if [ -n "$INF_VERIFY_RESULT" ] && echo "$INF_VERIFY_RESULT" | jq -e . &>/dev/null; then
@@ -430,10 +476,10 @@ cmd_verify() {
             echo "  Lunal Upstream Attestation: present but no verifier (attestation-cli not found)"
             INF_ATTEST_OK=true  # don't fail if CLI is missing
           fi
-        else
-          echo "  Lunal Upstream Attestation: present but could not decode (expected base64+gzip or JSON)"
+        elif [ "$INF_DECODED" = "false" ]; then
+          echo "  Lunal Upstream Attestation: present but could not decode (expected base64+gzip+HCLA, base64+gzip+JSON, or raw JSON)"
         fi
-        rm -f "$INF_EVIDENCE_FILE"
+        rm -f "$INF_EVIDENCE_FILE" "$INF_BIN_FILE"
       else
         echo "  Lunal Upstream Attestation: WARN — Attestation-Report header absent"
       fi
