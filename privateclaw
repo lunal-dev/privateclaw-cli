@@ -424,7 +424,23 @@ cmd_verify() {
       if [ -n "$ORCH_ATTESTATION" ]; then
         ORCH_ATTEST_OK=false
         ORCH_EVIDENCE_FILE=$(mktemp /tmp/orch_attestation_XXXXXX.json)
+        # Support two formats:
+        #   1. base64+gzip (old tee-proxy standalone mode)
+        #   2. raw JSON from tee-proxy --attestation-url mode (attestation-service sidecar)
+        #      In this case the header value is {"platform":..., "evidence":{...}};
+        #      attestation-cli verify expects the evidence sub-object.
+        ORCH_DECODED=false
         if echo "$ORCH_ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$ORCH_EVIDENCE_FILE" 2>/dev/null; then
+          ORCH_DECODED=true
+        elif echo "$ORCH_ATTESTATION" | jq -e . &>/dev/null 2>&1; then
+          # Raw JSON: extract .evidence if present, else use as-is
+          ORCH_EVIDENCE=$(echo "$ORCH_ATTESTATION" | jq -r 'if has("evidence") then .evidence else . end' 2>/dev/null)
+          if [ -n "$ORCH_EVIDENCE" ] && echo "$ORCH_EVIDENCE" | jq -e . &>/dev/null 2>&1; then
+            echo "$ORCH_EVIDENCE" > "$ORCH_EVIDENCE_FILE"
+            ORCH_DECODED=true
+          fi
+        fi
+        if [ "$ORCH_DECODED" = "true" ]; then
           if [ -n "$ATTESTATION_CLI" ]; then
             ORCH_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$ORCH_EVIDENCE_FILE" 2>/dev/null) || true
             if [ -n "$ORCH_VERIFY_RESULT" ] && echo "$ORCH_VERIFY_RESULT" | jq -e . &>/dev/null; then
@@ -445,7 +461,7 @@ cmd_verify() {
             ORCH_ATTEST_OK=true  # don't fail if CLI is missing, just note it
           fi
         else
-          echo "  Orchestrator Attestation: present but could not decode (base64+gzip)"
+          echo "  Orchestrator Attestation: present but could not decode (expected base64+gzip or JSON)"
         fi
         rm -f "$ORCH_EVIDENCE_FILE"
         # Both layers must pass for step [4/5] to succeed
