@@ -388,10 +388,28 @@ cmd_verify() {
       echo "  Provider:      ${INF_PROVIDER:-lunal}"
 
       # --- Lunal upstream attestation (Attestation-Report, passed through untouched by our tee-proxy) ---
+      # Support two formats Lunal may send:
+      #   1. base64+gzip (old standalone attestation inline mode)
+      #   2. raw JSON from attestation-service sidecar: {"platform":..., "evidence":{...}}
+      #      attestation-cli verify expects the .evidence sub-object (or the whole object
+      #      if no .evidence key is present).
       INF_ATTEST_OK=false
       if [ -n "$ATTESTATION" ]; then
         INF_EVIDENCE_FILE=$(mktemp /tmp/inference_attestation_XXXXXX.json)
-        if echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_EVIDENCE_FILE" 2>/dev/null; then
+        INF_DECODED=false
+        # Try 1: base64+gzip (backward compat with old Lunal inline attestation)
+        if echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_EVIDENCE_FILE" 2>/dev/null && jq -e . "$INF_EVIDENCE_FILE" &>/dev/null 2>&1; then
+          INF_DECODED=true
+        fi
+        # Try 2: raw JSON (new attestation-service sidecar format)
+        if [ "$INF_DECODED" = "false" ] && echo "$ATTESTATION" | jq -e . &>/dev/null 2>&1; then
+          INF_EVIDENCE=$(echo "$ATTESTATION" | jq -r 'if has("evidence") then .evidence else . end' 2>/dev/null)
+          if [ -n "$INF_EVIDENCE" ] && echo "$INF_EVIDENCE" | jq -e . &>/dev/null 2>&1; then
+            echo "$INF_EVIDENCE" > "$INF_EVIDENCE_FILE"
+            INF_DECODED=true
+          fi
+        fi
+        if [ "$INF_DECODED" = "true" ]; then
           # Verify with attestation-cli if available
           if [ -n "$ATTESTATION_CLI" ]; then
             INF_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$INF_EVIDENCE_FILE" 2>/dev/null) || true
@@ -413,7 +431,7 @@ cmd_verify() {
             INF_ATTEST_OK=true  # don't fail if CLI is missing
           fi
         else
-          echo "  Lunal Upstream Attestation: present but could not decode (base64+gzip)"
+          echo "  Lunal Upstream Attestation: present but could not decode (expected base64+gzip or JSON)"
         fi
         rm -f "$INF_EVIDENCE_FILE"
       else
