@@ -377,79 +377,85 @@ cmd_verify() {
 
     INF_PROVIDER=$(echo "$INF_HEADERS" | grep -i "^x-inference-provider:" | sed 's/[^:]*: *//' | tr -d '\r\n')
     ATTESTATION=$(echo "$INF_HEADERS" | grep -i "^attestation-report:" | sed 's/[^:]*: *//' | tr -d '\r\n')
-    UPSTREAM_ATTESTATION=$(echo "$INF_HEADERS" | grep -i "^x-upstream-attestation-report:" | sed 's/[^:]*: *//' | tr -d '\r\n')
+    ORCH_ATTESTATION=$(echo "$INF_HEADERS" | grep -i "^x-orchestrator-attestation-report:" | sed 's/[^:]*: *//' | tr -d '\r\n')
 
     if [ "$INF_PROVIDER" = "redpill" ]; then
       echo "  Provider:      redpill (failover)"
       echo "  Attestation:   not available (confidential model, attestation via separate endpoint)"
       echo "  Status:        WARN"
       FAIL_COUNT=$((FAIL_COUNT + 1))
-    elif [ -n "$ATTESTATION" ]; then
+    elif [ -n "$ATTESTATION" ] || [ -n "$ORCH_ATTESTATION" ]; then
       echo "  Provider:      ${INF_PROVIDER:-lunal}"
 
-      # --- Orchestrator-side attestation (tee-proxy Attestation-Report) ---
+      # --- Lunal upstream attestation (Attestation-Report, passed through untouched by our tee-proxy) ---
       INF_ATTEST_OK=false
-      INF_EVIDENCE_FILE=$(mktemp /tmp/inference_attestation_XXXXXX.json)
-      if echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_EVIDENCE_FILE" 2>/dev/null; then
-        # Verify with attestation-cli if available
-        if [ -n "$ATTESTATION_CLI" ]; then
-          INF_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$INF_EVIDENCE_FILE" 2>/dev/null) || true
-          if [ -n "$INF_VERIFY_RESULT" ] && echo "$INF_VERIFY_RESULT" | jq -e . &>/dev/null; then
-            INF_SIG_VALID=$(echo "$INF_VERIFY_RESULT" | jq -r '.signature_valid // false')
-            INF_PLATFORM=$(echo "$INF_VERIFY_RESULT" | jq -r '.platform // "unknown"')
-            echo "  Platform:      $INF_PLATFORM (via tee-proxy)"
-            if [ "$INF_SIG_VALID" = "true" ]; then
-              echo "  Attestation:   valid (signature verified)"
-              echo "  VCEK Chain:    VALID (AMD root CA -> VCEK -> SNP report)"
-              INF_ATTEST_OK=true
-            else
-              echo "  Attestation:   INVALID (signature verification failed)"
-            fi
-          else
-            echo "  Attestation:   present but verification failed"
-          fi
-        else
-          echo "  Attestation:   present but no verifier (attestation-cli not found)"
-        fi
-      else
-        echo "  Attestation:   present but could not decode (base64+gzip)"
-      fi
-      rm -f "$INF_EVIDENCE_FILE"
-
-      # --- Upstream (Lunal) attestation (X-Upstream-Attestation-Report, tee-proxy v0.3.0+) ---
-      if [ -n "$UPSTREAM_ATTESTATION" ]; then
-        UPSTREAM_ATTEST_OK=false
-        UPSTREAM_EVIDENCE_FILE=$(mktemp /tmp/upstream_attestation_XXXXXX.json)
-        if echo "$UPSTREAM_ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$UPSTREAM_EVIDENCE_FILE" 2>/dev/null; then
+      if [ -n "$ATTESTATION" ]; then
+        INF_EVIDENCE_FILE=$(mktemp /tmp/inference_attestation_XXXXXX.json)
+        if echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_EVIDENCE_FILE" 2>/dev/null; then
+          # Verify with attestation-cli if available
           if [ -n "$ATTESTATION_CLI" ]; then
-            UPSTREAM_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$UPSTREAM_EVIDENCE_FILE" 2>/dev/null) || true
-            if [ -n "$UPSTREAM_VERIFY_RESULT" ] && echo "$UPSTREAM_VERIFY_RESULT" | jq -e . &>/dev/null; then
-              UPSTREAM_SIG_VALID=$(echo "$UPSTREAM_VERIFY_RESULT" | jq -r '.signature_valid // false')
-              if [ "$UPSTREAM_SIG_VALID" = "true" ]; then
-                echo "  Upstream (Lunal) VCEK Chain: VALID"
-                UPSTREAM_ATTEST_OK=true
+            INF_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$INF_EVIDENCE_FILE" 2>/dev/null) || true
+            if [ -n "$INF_VERIFY_RESULT" ] && echo "$INF_VERIFY_RESULT" | jq -e . &>/dev/null; then
+              INF_SIG_VALID=$(echo "$INF_VERIFY_RESULT" | jq -r '.signature_valid // false')
+              INF_PLATFORM=$(echo "$INF_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+              echo "  Lunal Platform: $INF_PLATFORM (upstream inference cluster)"
+              if [ "$INF_SIG_VALID" = "true" ]; then
+                echo "  Lunal Upstream VCEK Chain: VALID (AMD root CA -> VCEK -> SNP report)"
+                INF_ATTEST_OK=true
               else
-                echo "  Upstream (Lunal) Attestation: INVALID (signature verification failed)"
+                echo "  Lunal Upstream Attestation: INVALID (signature verification failed)"
               fi
             else
-              echo "  Upstream (Lunal) Attestation: present but verification failed"
+              echo "  Lunal Upstream Attestation: present but verification failed"
             fi
           else
-            echo "  Upstream (Lunal) Attestation: present but no verifier (attestation-cli not found)"
-            UPSTREAM_ATTEST_OK=true  # don't fail if CLI is missing, just note it
+            echo "  Lunal Upstream Attestation: present but no verifier (attestation-cli not found)"
+            INF_ATTEST_OK=true  # don't fail if CLI is missing
           fi
         else
-          echo "  Upstream (Lunal) Attestation: present but could not decode (base64+gzip)"
+          echo "  Lunal Upstream Attestation: present but could not decode (base64+gzip)"
         fi
-        rm -f "$UPSTREAM_EVIDENCE_FILE"
+        rm -f "$INF_EVIDENCE_FILE"
+      else
+        echo "  Lunal Upstream Attestation: WARN — Attestation-Report header absent"
+      fi
+
+      # --- Orchestrator attestation (X-Orchestrator-Attestation-Report, set by our tee-proxy via --header-name) ---
+      if [ -n "$ORCH_ATTESTATION" ]; then
+        ORCH_ATTEST_OK=false
+        ORCH_EVIDENCE_FILE=$(mktemp /tmp/orch_attestation_XXXXXX.json)
+        if echo "$ORCH_ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$ORCH_EVIDENCE_FILE" 2>/dev/null; then
+          if [ -n "$ATTESTATION_CLI" ]; then
+            ORCH_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$ORCH_EVIDENCE_FILE" 2>/dev/null) || true
+            if [ -n "$ORCH_VERIFY_RESULT" ] && echo "$ORCH_VERIFY_RESULT" | jq -e . &>/dev/null; then
+              ORCH_SIG_VALID=$(echo "$ORCH_VERIFY_RESULT" | jq -r '.signature_valid // false')
+              ORCH_PLATFORM=$(echo "$ORCH_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+              echo "  Orchestrator Platform: $ORCH_PLATFORM (our tee-proxy)"
+              if [ "$ORCH_SIG_VALID" = "true" ]; then
+                echo "  Orchestrator VCEK Chain: VALID (AMD root CA -> VCEK -> SNP report)"
+                ORCH_ATTEST_OK=true
+              else
+                echo "  Orchestrator Attestation: INVALID (signature verification failed)"
+              fi
+            else
+              echo "  Orchestrator Attestation: present but verification failed"
+            fi
+          else
+            echo "  Orchestrator Attestation: present but no verifier (attestation-cli not found)"
+            ORCH_ATTEST_OK=true  # don't fail if CLI is missing, just note it
+          fi
+        else
+          echo "  Orchestrator Attestation: present but could not decode (base64+gzip)"
+        fi
+        rm -f "$ORCH_EVIDENCE_FILE"
         # Both layers must pass for step [4/5] to succeed
-        if [ "$UPSTREAM_ATTEST_OK" != "true" ]; then
+        if [ "$ORCH_ATTEST_OK" != "true" ]; then
           INF_ATTEST_OK=false
         fi
       else
-        # Upstream header absent — backward-compat WARN (tee-proxy may be pre-v0.3.0, or Lunal not sending)
-        echo "  Upstream (Lunal) Attestation: WARN — header absent (tee-proxy pre-v0.3.0 or Lunal not sending)"
-        echo "  Using orchestrator-only attestation."
+        # Orchestrator header absent — tee-proxy may not be configured with --header-name yet
+        echo "  Orchestrator Attestation: WARN — X-Orchestrator-Attestation-Report absent (tee-proxy may need --header-name=X-Orchestrator-Attestation-Report)"
+        echo "  Using Lunal upstream attestation only."
       fi
 
       if [ "$INF_ATTEST_OK" = "true" ]; then
