@@ -3,7 +3,7 @@ set -e
 
 # PrivateClaw CLI
 # TEE verification and management for PrivateClaw CVMs.
-# https://github.com/lunal-dev/privateclaw-cli
+# https://github.com/lunal-dev/privateclaw-cli (repo name unchanged)
 
 ATTEST_DIR="/etc/privateclaw"
 EVIDENCE_FILE="$ATTEST_DIR/evidence.json"
@@ -18,6 +18,8 @@ ATTESTATION_CLI="${ATTESTATION_CLI_PATH:-}"
 if [ -z "$ATTESTATION_CLI" ]; then
   if command -v attestation-cli &>/dev/null; then
     ATTESTATION_CLI="attestation-cli"
+  elif [ -x /opt/confidential-services/attestation-cli ]; then
+    ATTESTATION_CLI="/opt/confidential-services/attestation-cli"
   elif [ -x /opt/lunal-services/attestation-cli ]; then
     ATTESTATION_CLI="/opt/lunal-services/attestation-cli"
   fi
@@ -361,8 +363,12 @@ cmd_verify() {
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo ""
   else
-    ENDPOINT=$(jq -r '.models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
+    # Try "confidential" provider first, fall back to legacy "lunal" for older configs
+    ENDPOINT=$(jq -r '.models.providers.confidential.baseUrl // .models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
     echo "  Endpoint:      $ENDPOINT"
+
+    # Read bearer token from openclaw config (apiKey field)
+    BEARER_TOKEN=$(jq -r '.models.providers.confidential.apiKey // .models.providers.lunal.apiKey // empty' "$OC_CONFIG" 2>/dev/null || true)
 
     # Make a minimal request to the inference endpoint and capture response headers
     INF_HEADERS=""
@@ -371,7 +377,13 @@ cmd_verify() {
       # with `-X POST` and curl bails out producing no output. Use `-D -` to
       # dump headers from a real GET request instead. The /v1/models endpoint
       # returns the same Attestation-Report header as /chat/completions.
-      INF_HEADERS=$(curl -s -D - -o /dev/null "$ENDPOINT/models" \
+      # -k: accept self-signed TLS cert on gateway; the attestation headers
+      # (VCEK chain) provide the real trust anchor, not TLS cert validation.
+      CURL_AUTH_ARGS=()
+      if [ -n "$BEARER_TOKEN" ] && [ "$BEARER_TOKEN" != "not-needed" ]; then
+        CURL_AUTH_ARGS=(-H "Authorization: Bearer $BEARER_TOKEN")
+      fi
+      INF_HEADERS=$(curl -s -k -D - -o /dev/null "${CURL_AUTH_ARGS[@]}" "$ENDPOINT/models" \
         --max-time 10 2>/dev/null) || true
     fi
 
@@ -385,10 +397,10 @@ cmd_verify() {
       echo "  Status:        WARN"
       FAIL_COUNT=$((FAIL_COUNT + 1))
     elif [ -n "$ATTESTATION" ] || [ -n "$ORCH_ATTESTATION" ]; then
-      echo "  Provider:      ${INF_PROVIDER:-lunal}"
+      echo "  Provider:      ${INF_PROVIDER:-confidential}"
 
-      # --- Lunal upstream attestation (Attestation-Report, passed through untouched by our tee-proxy) ---
-      # Support two formats Lunal may send:
+      # --- Confidential AI upstream attestation (Attestation-Report, passed through untouched by our tee-proxy) ---
+      # Support two formats Confidential AI may send:
       #   1. base64+gzip (old standalone attestation inline mode)
       #   2. raw JSON from attestation-service sidecar: {"platform":..., "evidence":{...}}
       #      attestation-cli verify expects the .evidence sub-object (or the whole object
@@ -415,7 +427,7 @@ cmd_verify() {
         fi
         # Try 3: base64+gzip → raw HCLA binary (Azure HCL Attestation Report)
         # Format: 8-byte header + "HCLA" magic (hex 48434c41) + SNP report + embedded PEM certs.
-        # Lunal's tee-proxy sends this format directly — NOT the attestation-service JSON format.
+        # Confidential AI's tee-proxy sends this format directly — NOT the attestation-service JSON format.
         # We extract the embedded VCEK/ASK/ARK cert chain and verify with openssl.
         if [ "$INF_DECODED" = "false" ] && [ -s "$INF_BIN_FILE" ]; then
           HCLA_MAGIC=$(dd if="$INF_BIN_FILE" bs=1 skip=8 count=4 2>/dev/null | xxd -p 2>/dev/null || true)
@@ -442,15 +454,15 @@ PYEOF
               cat "$INF_ASK_PEM" "$INF_ARK_PEM" > "$INF_CHAIN_PEM"
               VCEK_VERIFY=$(openssl verify -CAfile "$INF_CHAIN_PEM" "$INF_VCEK_PEM" 2>&1) || true
               if echo "$VCEK_VERIFY" | grep -q ": OK"; then
-                echo "  Lunal Upstream VCEK Chain:  VALID (AMD root CA -> ASK -> VCEK)"
+                echo "  Confidential AI Upstream VCEK Chain:  VALID (AMD root CA -> ASK -> VCEK)"
                 INF_ATTEST_OK=true
                 INF_DECODED=true
               else
-                echo "  Lunal Upstream Attestation: HCLA binary present but cert chain invalid"
+                echo "  Confidential AI Upstream Attestation: HCLA binary present but cert chain invalid"
                 echo "    openssl: $VCEK_VERIFY"
               fi
             else
-              echo "  Lunal Upstream Attestation: HCLA binary present but could not extract PEM certs"
+              echo "  Confidential AI Upstream Attestation: HCLA binary present but could not extract PEM certs"
             fi
             rm -f "$INF_VCEK_PEM" "$INF_ASK_PEM" "$INF_ARK_PEM" "$INF_CHAIN_PEM"
           fi
@@ -462,26 +474,26 @@ PYEOF
             if [ -n "$INF_VERIFY_RESULT" ] && echo "$INF_VERIFY_RESULT" | jq -e . &>/dev/null; then
               INF_SIG_VALID=$(echo "$INF_VERIFY_RESULT" | jq -r '.signature_valid // false')
               INF_PLATFORM=$(echo "$INF_VERIFY_RESULT" | jq -r '.platform // "unknown"')
-              echo "  Lunal Platform: $INF_PLATFORM (upstream inference cluster)"
+              echo "  Confidential AI Platform: $INF_PLATFORM (upstream inference cluster)"
               if [ "$INF_SIG_VALID" = "true" ]; then
-                echo "  Lunal Upstream VCEK Chain: VALID (AMD root CA -> VCEK -> SNP report)"
+                echo "  Confidential AI Upstream VCEK Chain: VALID (AMD root CA -> VCEK -> SNP report)"
                 INF_ATTEST_OK=true
               else
-                echo "  Lunal Upstream Attestation: INVALID (signature verification failed)"
+                echo "  Confidential AI Upstream Attestation: INVALID (signature verification failed)"
               fi
             else
-              echo "  Lunal Upstream Attestation: present but verification failed"
+              echo "  Confidential AI Upstream Attestation: present but verification failed"
             fi
           else
-            echo "  Lunal Upstream Attestation: present but no verifier (attestation-cli not found)"
+            echo "  Confidential AI Upstream Attestation: present but no verifier (attestation-cli not found)"
             INF_ATTEST_OK=true  # don't fail if CLI is missing
           fi
         elif [ "$INF_DECODED" = "false" ]; then
-          echo "  Lunal Upstream Attestation: present but could not decode (expected base64+gzip+HCLA, base64+gzip+JSON, or raw JSON)"
+          echo "  Confidential AI Upstream Attestation: present but could not decode (expected base64+gzip+HCLA, base64+gzip+JSON, or raw JSON)"
         fi
         rm -f "$INF_EVIDENCE_FILE" "$INF_BIN_FILE"
       else
-        echo "  Lunal Upstream Attestation: WARN — Attestation-Report header absent"
+        echo "  Confidential AI Upstream Attestation: WARN — Attestation-Report header absent"
       fi
 
       # --- Orchestrator attestation (X-Orchestrator-Attestation-Report, set by our tee-proxy via --header-name) ---
@@ -535,7 +547,7 @@ PYEOF
       else
         # Orchestrator header absent — tee-proxy may not be configured with --header-name yet
         echo "  Orchestrator Attestation: WARN — X-Orchestrator-Attestation-Report absent (tee-proxy may need --header-name=X-Orchestrator-Attestation-Report)"
-        echo "  Using Lunal upstream attestation only."
+        echo "  Using Confidential AI upstream attestation only."
       fi
 
       if [ "$INF_ATTEST_OK" = "true" ]; then
@@ -628,8 +640,8 @@ cmd_assign() {
 
   SSH_KEY=$(echo "$JSON" | jq -r '.ssh_public_key // empty')
   INSTANCE_NAME=$(echo "$JSON" | jq -r '.instance_name // empty')
-  LUNAL_ENDPOINT=$(echo "$JSON" | jq -r '.lunal_endpoint // empty')
-  LUNAL_MODEL=$(echo "$JSON" | jq -r '.lunal_model // empty')
+  LUNAL_ENDPOINT=$(echo "$JSON" | jq -r '.confidential_endpoint // .lunal_endpoint // empty')
+  LUNAL_MODEL=$(echo "$JSON" | jq -r '.confidential_model // .lunal_model // empty')
   DNS_ZONE=$(echo "$JSON" | jq -r '.dns_zone // empty')
   ORCHESTRATOR_IP=$(echo "$JSON" | jq -r '.orchestrator_ip // empty')
 
@@ -647,7 +659,7 @@ cmd_assign() {
   chmod 700 /home/$ADMIN_USER/.ssh
   chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys
 
-  # 2. Configure OpenClaw with Lunal inference
+  # 2. Configure OpenClaw with Confidential AI inference
   GATEWAY_TOKEN=$(openssl rand -hex 16)
   sudo -u $ADMIN_USER mkdir -p /home/$ADMIN_USER/.openclaw
   cat > /home/$ADMIN_USER/.openclaw/openclaw.json << OCEOF
@@ -662,7 +674,7 @@ cmd_assign() {
     },
     "models": {
       "providers": {
-        "lunal": {
+        "confidential": {
           "api": "openai-completions",
           "baseUrl": "${LUNAL_ENDPOINT}/v1",
           "apiKey": "not-needed",
@@ -686,7 +698,7 @@ cmd_assign() {
     "agents": {
       "defaults": {
         "model": {
-          "primary": "lunal/${LUNAL_MODEL}"
+          "primary": "confidential/${LUNAL_MODEL}"
         },
         "heartbeat": {
           "every": "30m"
