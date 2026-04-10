@@ -377,13 +377,13 @@ cmd_verify() {
       # with `-X POST` and curl bails out producing no output. Use `-D -` to
       # dump headers from a real GET request instead. The /v1/models endpoint
       # returns the same Attestation-Report header as /chat/completions.
-      # -k: accept self-signed TLS cert on gateway; the attestation headers
-      # (VCEK chain) provide the real trust anchor, not TLS cert validation.
+      # The gateway's TLS cert is signed by our private CA, which is installed
+      # into the CVM's system CA store at boot (via cloud-init). No -k needed.
       CURL_AUTH_ARGS=()
       if [ -n "$BEARER_TOKEN" ] && [ "$BEARER_TOKEN" != "not-needed" ]; then
         CURL_AUTH_ARGS=(-H "Authorization: Bearer $BEARER_TOKEN")
       fi
-      INF_HEADERS=$(curl -s -k -D - -o /dev/null "${CURL_AUTH_ARGS[@]}" "$ENDPOINT/models" \
+      INF_HEADERS=$(curl -s -D - -o /dev/null "${CURL_AUTH_ARGS[@]}" "$ENDPOINT/models" \
         --max-time 10 2>/dev/null) || true
     fi
 
