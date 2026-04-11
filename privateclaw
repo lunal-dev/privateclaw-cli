@@ -106,13 +106,14 @@ EOFEVIDENCE
 #     3. Host Key Binding   — SSH host key hash matches boot-time record
 #     4. Inference Provider  — endpoint reachable + attestation header
 #     5. Access Lockout      — SSH keys + firewall
+#     6. VM Extensions       — Azure Guest Agent extensions disabled
 # ---------------------------------------------------------------------------
 cmd_verify() {
   echo ""
   echo "=== PrivateClaw TEE Verification ==="
   echo ""
 
-  TOTAL_CHECKS=5
+  TOTAL_CHECKS=6
   PASS_COUNT=0
   FAIL_COUNT=0
 
@@ -591,6 +592,26 @@ PYEOF
     PASS_COUNT=$((PASS_COUNT + 1))
   else
     echo "  Status:        WARN ($KEY_COUNT keys — expected 1)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  fi
+  echo ""
+
+  # ==========================================================================
+  # Check 6: Azure VM Extensions (Guest Agent)
+  # ==========================================================================
+  echo "[6/$TOTAL_CHECKS] VM Extensions"
+  EXTENSIONS_ALLOWED=$(curl -sf -H "Metadata: true" \
+    "http://169.254.169.254/metadata/instance/compute/osProfile/allowExtensionOperations?api-version=2021-02-01&format=text" 2>/dev/null || echo "unknown")
+  echo "  Extensions:    allowExtensionOperations=$EXTENSIONS_ALLOWED"
+  if [ "$EXTENSIONS_ALLOWED" = "false" ]; then
+    echo "  Status:        PASS"
+    PASS_COUNT=$((PASS_COUNT + 1))
+  elif [ "$EXTENSIONS_ALLOWED" = "true" ]; then
+    echo "  Status:        WARN (Azure VM extensions are enabled — operator can execute commands via az vm run-command)"
+    echo "                 Expected to WARN on staging (extensions enabled for debugging), PASS on prod"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  else
+    echo "  Status:        WARN (could not query IMDS for extension status)"
     FAIL_COUNT=$((FAIL_COUNT + 1))
   fi
   echo ""
