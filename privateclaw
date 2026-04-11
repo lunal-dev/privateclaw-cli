@@ -497,7 +497,7 @@ PYEOF
         echo "  Confidential AI Upstream Attestation: WARN — Attestation-Report header absent"
       fi
 
-      # --- Orchestrator attestation (X-Orchestrator-Attestation-Report, set by our tee-proxy via --header-name) ---
+      # --- Gateway attestation (X-Orchestrator-Attestation-Report, set by our tee-proxy via --header-name) ---
       if [ -n "$ORCH_ATTESTATION" ]; then
         ORCH_ATTEST_OK=false
         ORCH_EVIDENCE_FILE=$(mktemp /tmp/orch_attestation_XXXXXX.json)
@@ -523,22 +523,22 @@ PYEOF
             if [ -n "$ORCH_VERIFY_RESULT" ] && echo "$ORCH_VERIFY_RESULT" | jq -e . &>/dev/null; then
               ORCH_SIG_VALID=$(echo "$ORCH_VERIFY_RESULT" | jq -r '.signature_valid // false')
               ORCH_PLATFORM=$(echo "$ORCH_VERIFY_RESULT" | jq -r '.platform // "unknown"')
-              echo "  Orchestrator Platform: $ORCH_PLATFORM (our tee-proxy)"
+              echo "  Gateway Platform: $ORCH_PLATFORM (our tee-proxy)"
               if [ "$ORCH_SIG_VALID" = "true" ]; then
-                echo "  Orchestrator VCEK Chain: VALID (AMD root CA -> VCEK -> SNP report)"
+                echo "  Gateway VCEK Chain: VALID (AMD root CA -> VCEK -> SNP report)"
                 ORCH_ATTEST_OK=true
               else
-                echo "  Orchestrator Attestation: INVALID (signature verification failed)"
+                echo "  Gateway Attestation: INVALID (signature verification failed)"
               fi
             else
-              echo "  Orchestrator Attestation: present but verification failed"
+              echo "  Gateway Attestation: present but verification failed"
             fi
           else
-            echo "  Orchestrator Attestation: present but no verifier (attestation-cli not found)"
+            echo "  Gateway Attestation: present but no verifier (attestation-cli not found)"
             ORCH_ATTEST_OK=true  # don't fail if CLI is missing, just note it
           fi
         else
-          echo "  Orchestrator Attestation: present but could not decode (expected base64+gzip or JSON)"
+          echo "  Gateway Attestation: present but could not decode (expected base64+gzip or JSON)"
         fi
         rm -f "$ORCH_EVIDENCE_FILE"
         # Both layers must pass for step [4/5] to succeed
@@ -546,8 +546,8 @@ PYEOF
           INF_ATTEST_OK=false
         fi
       else
-        # Orchestrator header absent — tee-proxy may not be configured with --header-name yet
-        echo "  Orchestrator Attestation: WARN — X-Orchestrator-Attestation-Report absent (tee-proxy may need --header-name=X-Orchestrator-Attestation-Report)"
+        # Gateway header absent — tee-proxy may not be configured with --header-name yet
+        echo "  Gateway Attestation: WARN — X-Orchestrator-Attestation-Report absent (tee-proxy may need --header-name=X-Orchestrator-Attestation-Report)"
         echo "  Using Confidential AI upstream attestation only."
       fi
 
