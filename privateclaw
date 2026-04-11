@@ -589,22 +589,29 @@ PYEOF
     echo "  Firewall:      $UFW_STATUS"
   fi
 
-  EXTENSIONS_ALLOWED=$(curl -sf -H "Metadata: true" \
-    "http://169.254.169.254/metadata/instance/compute/osProfile/allowExtensionOperations?api-version=2021-02-01&format=text" 2>/dev/null || echo "unknown")
-  if [ "$EXTENSIONS_ALLOWED" = "false" ]; then
-    echo "  Azure VM Extensions: disabled (PASS)"
-  elif [ "$EXTENSIONS_ALLOWED" = "true" ]; then
-    echo "  Azure VM Extensions: enabled (WARN)"
+  # Check if Azure Guest Agent can receive extensions
+  # Method 1: Check walinuxagent service status
+  WAAGENT_STATUS=$(systemctl is-active walinuxagent 2>/dev/null || echo "inactive")
+  # Method 2: Check waagent.conf Extensions.Enabled setting
+  EXTENSIONS_CONF=$(grep -i "^Extensions.Enabled" /etc/waagent.conf 2>/dev/null | cut -d= -f2 | tr -d ' ' || echo "unknown")
+
+  if [ "$WAAGENT_STATUS" = "inactive" ] || [ "$EXTENSIONS_CONF" = "n" ]; then
+    echo "  VM Extensions: disabled (waagent $WAAGENT_STATUS, config=$EXTENSIONS_CONF)"
+    EXTENSIONS_DISABLED="true"
+  elif [ "$WAAGENT_STATUS" = "active" ] && [ "$EXTENSIONS_CONF" != "n" ]; then
+    echo "  VM Extensions: WARN — waagent is running, az vm run-command may work"
+    EXTENSIONS_DISABLED="false"
   else
-    echo "  Azure VM Extensions: unknown (WARN)"
+    echo "  VM Extensions: waagent=$WAAGENT_STATUS, config=$EXTENSIONS_CONF"
+    EXTENSIONS_DISABLED="false"
   fi
 
   # Overall: PASS requires SSH keys<=1 AND firewall active AND extensions disabled.
-  # Extensions enabled/unknown is a WARN (staging intentionally has them on).
-  if [ "$KEY_COUNT" -le 1 ] && [ "$EXTENSIONS_ALLOWED" = "false" ]; then
+  # Extensions enabled is a WARN (staging intentionally has them on).
+  if [ "$KEY_COUNT" -le 1 ] && [ "$EXTENSIONS_DISABLED" = "true" ]; then
     echo "  Status:        PASS"
     PASS_COUNT=$((PASS_COUNT + 1))
-  elif [ "$KEY_COUNT" -le 1 ] && { [ "$EXTENSIONS_ALLOWED" = "true" ] || [ "$EXTENSIONS_ALLOWED" = "unknown" ]; }; then
+  elif [ "$KEY_COUNT" -le 1 ] && [ "$EXTENSIONS_DISABLED" = "false" ]; then
     echo "  Status:        WARN (VM extensions not disabled — expected on staging, not on prod)"
     FAIL_COUNT=$((FAIL_COUNT + 1))
   else
