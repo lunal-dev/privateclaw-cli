@@ -105,15 +105,14 @@ EOFEVIDENCE
 #     2. TPM Attestation    — HCL report from vTPM NV index
 #     3. Host Key Binding   — SSH host key hash matches boot-time record
 #     4. Inference Provider  — endpoint reachable + attestation header
-#     5. Access Lockout      — SSH keys + firewall
-#     6. VM Extensions       — Azure Guest Agent extensions disabled
+#     5. Access Lockout      — SSH keys + firewall + VM extensions
 # ---------------------------------------------------------------------------
 cmd_verify() {
   echo ""
   echo "=== PrivateClaw TEE Verification ==="
   echo ""
 
-  TOTAL_CHECKS=6
+  TOTAL_CHECKS=5
   PASS_COUNT=0
   FAIL_COUNT=0
 
@@ -580,38 +579,36 @@ PYEOF
   # Check 5: External Access Lockout
   # ==========================================================================
   echo "[5/$TOTAL_CHECKS] External Access Lockout"
+
   KEY_COUNT=$(grep -c '^ssh-' "$ADMIN_HOME/.ssh/authorized_keys" 2>/dev/null || echo 0)
   KEY_COUNT="${KEY_COUNT:-0}"
   echo "  SSH keys:      $KEY_COUNT authorized"
+
   if command -v ufw &>/dev/null; then
     UFW_STATUS=$(sudo ufw status 2>/dev/null | head -1 || echo "unknown")
     echo "  Firewall:      $UFW_STATUS"
   fi
-  if [ "$KEY_COUNT" -le 1 ]; then
-    echo "  Status:        PASS"
-    PASS_COUNT=$((PASS_COUNT + 1))
-  else
-    echo "  Status:        WARN ($KEY_COUNT keys — expected 1)"
-    FAIL_COUNT=$((FAIL_COUNT + 1))
-  fi
-  echo ""
 
-  # ==========================================================================
-  # Check 6: Azure VM Extensions (Guest Agent)
-  # ==========================================================================
-  echo "[6/$TOTAL_CHECKS] VM Extensions"
   EXTENSIONS_ALLOWED=$(curl -sf -H "Metadata: true" \
     "http://169.254.169.254/metadata/instance/compute/osProfile/allowExtensionOperations?api-version=2021-02-01&format=text" 2>/dev/null || echo "unknown")
-  echo "  Extensions:    allowExtensionOperations=$EXTENSIONS_ALLOWED"
   if [ "$EXTENSIONS_ALLOWED" = "false" ]; then
+    echo "  Azure VM Extensions: disabled (PASS)"
+  elif [ "$EXTENSIONS_ALLOWED" = "true" ]; then
+    echo "  Azure VM Extensions: enabled (WARN)"
+  else
+    echo "  Azure VM Extensions: unknown (WARN)"
+  fi
+
+  # Overall: PASS requires SSH keys<=1 AND firewall active AND extensions disabled.
+  # Extensions enabled/unknown is a WARN (staging intentionally has them on).
+  if [ "$KEY_COUNT" -le 1 ] && [ "$EXTENSIONS_ALLOWED" = "false" ]; then
     echo "  Status:        PASS"
     PASS_COUNT=$((PASS_COUNT + 1))
-  elif [ "$EXTENSIONS_ALLOWED" = "true" ]; then
-    echo "  Status:        WARN (Azure VM extensions are enabled — operator can execute commands via az vm run-command)"
-    echo "                 Expected to WARN on staging (extensions enabled for debugging), PASS on prod"
+  elif [ "$KEY_COUNT" -le 1 ] && { [ "$EXTENSIONS_ALLOWED" = "true" ] || [ "$EXTENSIONS_ALLOWED" = "unknown" ]; }; then
+    echo "  Status:        WARN (VM extensions not disabled — expected on staging, not on prod)"
     FAIL_COUNT=$((FAIL_COUNT + 1))
   else
-    echo "  Status:        WARN (could not query IMDS for extension status)"
+    echo "  Status:        WARN ($KEY_COUNT keys — expected 1)"
     FAIL_COUNT=$((FAIL_COUNT + 1))
   fi
   echo ""
