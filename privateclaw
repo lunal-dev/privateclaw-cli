@@ -377,7 +377,7 @@ cmd_verify() {
   OC_CONFIG="$ADMIN_HOME/.openclaw/openclaw.json"
   if [ ! -f "$OC_CONFIG" ]; then
     [ "$VERBOSE" = "true" ] && echo "  Config:        not found at $OC_CONFIG"
-    echo "  Status:               FAIL"
+    echo "  Status:     FAIL"
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo ""
   else
@@ -630,7 +630,7 @@ PYEOF
     # headers. Treat as FAIL with no sub-checks.
     if [ -z "$UPSTREAM_LABEL" ] && [ -z "$GATEWAY_DETAIL" ] && [ -z "$INF_HEADERS" ]; then
       [ "$VERBOSE" = "true" ] && echo "  Connection:    could not reach inference endpoint"
-      echo "  Status:               FAIL"
+      echo "  Status:     FAIL"
       FAIL_COUNT=$((FAIL_COUNT + 1))
       echo ""
     else
@@ -642,20 +642,28 @@ PYEOF
         UPSTREAM_LABEL="Confidential AI:"
         UPSTREAM_DETAIL="Verification failed"
       fi
-      printf "  %-21s %s\n" "$UPSTREAM_LABEL" "$UPSTREAM_DETAIL"
-      printf "  %-21s %s\n" "PrivateClaw Gateway:" "$GATEWAY_DETAIL"
+      # Label on its own line; value indented to column 15 on the next line.
+      # This keeps long upstream labels (e.g. "Redpill (failover):") and long
+      # detail strings from colliding, and stays readable in narrow terminals.
+      printf "  %s\n" "$UPSTREAM_LABEL"
+      printf "              %s\n" "$UPSTREAM_DETAIL"
+      printf "  %s\n" "PrivateClaw Gateway:"
+      printf "              %s\n" "$GATEWAY_DETAIL"
 
       # --- Roll up Status ---
+      # Status stays on a single line (matches other steps), but uses a
+      # narrower label width than the other checks so the sub-check values
+      # above (indented to col 15) line up visually with the Status value.
       if [ "$UPSTREAM_OK" = "true" ] && [ "$GATEWAY_OK" = "true" ]; then
         if [ "$FAILOVER_ACTIVE" = "true" ]; then
-          echo "  Status:               WARN (Redpill failover active)"
+          echo "  Status:     WARN (Redpill failover active)"
           FAIL_COUNT=$((FAIL_COUNT + 1))
         else
-          echo "  Status:               PASS"
+          echo "  Status:     PASS"
           PASS_COUNT=$((PASS_COUNT + 1))
         fi
       else
-        echo "  Status:               FAIL"
+        echo "  Status:     FAIL"
         FAIL_COUNT=$((FAIL_COUNT + 1))
       fi
       echo ""
@@ -678,7 +686,15 @@ PYEOF
 
   # Check if Azure Guest Agent can receive extensions
   # Method 1: Check walinuxagent service status
-  WAAGENT_STATUS=$(systemctl is-active walinuxagent 2>/dev/null || echo "inactive")
+  #
+  # NOTE: `systemctl is-active` prints its verdict AND exits non-zero for any
+  # non-active state (e.g. "inactive" -> exit 3, "masked" -> exit 3). Using
+  # `|| echo "inactive"` then APPENDS a second "inactive" onto stdout, and
+  # the resulting "inactive\ninactive" string never equals "inactive" in the
+  # comparison below. Capture stdout unconditionally, trim, default to
+  # "inactive" if empty.
+  WAAGENT_STATUS=$(systemctl is-active walinuxagent 2>/dev/null | head -1 | tr -d '[:space:]')
+  [ -z "$WAAGENT_STATUS" ] && WAAGENT_STATUS="inactive"
   # Method 2: Check waagent.conf Extensions.Enabled setting
   EXTENSIONS_CONF=$(grep -i "^Extensions.Enabled" /etc/waagent.conf 2>/dev/null | cut -d= -f2 | tr -d ' ' || echo "unknown")
 
