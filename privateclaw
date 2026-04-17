@@ -5,7 +5,7 @@ set -e
 # TEE verification and management for PrivateClaw CVMs.
 # https://github.com/lunal-dev/privateclaw-cli (repo name unchanged)
 
-VERSION="v1.5.6"
+VERSION="v1.5.7"
 
 ATTEST_DIR="/etc/privateclaw"
 EVIDENCE_FILE="$ATTEST_DIR/evidence.json"
@@ -107,7 +107,7 @@ EOFEVIDENCE
 #     2. TPM Attestation    — HCL report from vTPM NV index
 #     3. Host Key Binding   — SSH host key hash matches boot-time record
 #     4. Inference Provider  — endpoint reachable + attestation header
-#     5. Access Lockout      — SSH keys + firewall + VM extensions
+#     5. Access Lockout      — SSH keys + firewall + cloud provider access
 # ---------------------------------------------------------------------------
 cmd_verify() {
   # Parse flags: --verbose / -v shows the full diagnostic info (cert chains,
@@ -379,7 +379,7 @@ cmd_verify() {
   OC_CONFIG="$ADMIN_HOME/.openclaw/openclaw.json"
   if [ ! -f "$OC_CONFIG" ]; then
     [ "$VERBOSE" = "true" ] && echo "  Config:        not found at $OC_CONFIG"
-    echo "  Status:     FAIL"
+    echo "  Status:        FAIL"
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo ""
   else
@@ -632,7 +632,7 @@ PYEOF
     # headers. Treat as FAIL with no sub-checks.
     if [ -z "$UPSTREAM_LABEL" ] && [ -z "$GATEWAY_DETAIL" ] && [ -z "$INF_HEADERS" ]; then
       [ "$VERBOSE" = "true" ] && echo "  Connection:    could not reach inference endpoint"
-      echo "  Status:     FAIL"
+      echo "  Status:        FAIL"
       FAIL_COUNT=$((FAIL_COUNT + 1))
       echo ""
     else
@@ -644,28 +644,27 @@ PYEOF
         UPSTREAM_LABEL="Confidential AI:"
         UPSTREAM_DETAIL="Verification failed"
       fi
-      # Label on its own line; value indented to column 15 on the next line.
+      # Label on its own line; value indented to column 18 on the next line.
       # This keeps long upstream labels (e.g. "Redpill (failover):") and long
       # detail strings from colliding, and stays readable in narrow terminals.
+      # The 17-space indent matches the "Status:" value column used elsewhere.
       printf "  %s\n" "$UPSTREAM_LABEL"
-      printf "              %s\n" "$UPSTREAM_DETAIL"
+      printf "                 %s\n" "$UPSTREAM_DETAIL"
       printf "  %s\n" "PrivateClaw Gateway:"
-      printf "              %s\n" "$GATEWAY_DETAIL"
+      printf "                 %s\n" "$GATEWAY_DETAIL"
 
       # --- Roll up Status ---
-      # Status stays on a single line (matches other steps), but uses a
-      # narrower label width than the other checks so the sub-check values
-      # above (indented to col 15) line up visually with the Status value.
+      # Status stays on a single line (matches other steps); value at col 18.
       if [ "$UPSTREAM_OK" = "true" ] && [ "$GATEWAY_OK" = "true" ]; then
         if [ "$FAILOVER_ACTIVE" = "true" ]; then
-          echo "  Status:     WARN (Redpill failover active)"
+          echo "  Status:        WARN (Redpill failover active)"
           FAIL_COUNT=$((FAIL_COUNT + 1))
         else
-          echo "  Status:     PASS"
+          echo "  Status:        PASS"
           PASS_COUNT=$((PASS_COUNT + 1))
         fi
       else
-        echo "  Status:     FAIL"
+        echo "  Status:        FAIL"
         FAIL_COUNT=$((FAIL_COUNT + 1))
       fi
       echo ""
@@ -702,11 +701,17 @@ PYEOF
 
   # PASS requires BOTH: waagent inactive AND config disables extensions.
   # Anything else is FAIL — no WARN state.
+  # Label "Cloud provider access:" is too long to fit on a single line with
+  # padding to col 18, so print label and value on separate lines (same
+  # treatment as step [4/5]). Keep the "(waagent ..., config=...)" diagnostic
+  # suffix visible so users can google these exact terms.
   if [ "$WAAGENT_STATUS" = "inactive" ] && [ "$EXTENSIONS_CONF" = "n" ]; then
-    echo "  VM Extensions: disabled (waagent $WAAGENT_STATUS, config=$EXTENSIONS_CONF)"
+    echo "  Cloud provider access:"
+    echo "                 disabled (waagent $WAAGENT_STATUS, config=$EXTENSIONS_CONF)"
     EXTENSIONS_DISABLED="true"
   else
-    echo "  VM Extensions: FAIL — not fully locked out (waagent=$WAAGENT_STATUS, config=$EXTENSIONS_CONF)"
+    echo "  Cloud provider access:"
+    echo "                 FAIL — not fully locked out (waagent=$WAAGENT_STATUS, config=$EXTENSIONS_CONF)"
     EXTENSIONS_DISABLED="false"
   fi
 
@@ -715,7 +720,7 @@ PYEOF
     echo "  Status:        PASS"
     PASS_COUNT=$((PASS_COUNT + 1))
   elif [ "$KEY_COUNT" -le 1 ] && [ "$EXTENSIONS_DISABLED" = "false" ]; then
-    echo "  Status:        FAIL (VM extensions not disabled)"
+    echo "  Status:        FAIL (Cloud provider access not blocked)"
     FAIL_COUNT=$((FAIL_COUNT + 1))
   else
     echo "  Status:        FAIL ($KEY_COUNT SSH keys — expected 1)"
