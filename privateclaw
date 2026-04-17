@@ -5,6 +5,8 @@ set -e
 # TEE verification and management for PrivateClaw CVMs.
 # https://github.com/lunal-dev/privateclaw-cli (repo name unchanged)
 
+VERSION="v1.5.6"
+
 ATTEST_DIR="/etc/privateclaw"
 EVIDENCE_FILE="$ATTEST_DIR/evidence.json"
 SNP_EVIDENCE_FILE="$ATTEST_DIR/snp_evidence.json"
@@ -894,12 +896,73 @@ MOTDEOF
 }
 
 # ---------------------------------------------------------------------------
+# privateclaw info
+#   Print environment info for user debugging: component versions, hostname,
+#   gateway IP, and install date.
+# ---------------------------------------------------------------------------
+cmd_info() {
+  # attestation-cli version
+  local att_version="not found"
+  if [ -n "$ATTESTATION_CLI" ]; then
+    att_version=$($ATTESTATION_CLI --version 2>/dev/null || echo "not found")
+  fi
+
+  # openclaw version -- try binary first, then fall back to package.json
+  local openclaw_version="not found"
+  if command -v openclaw &>/dev/null; then
+    openclaw_version=$(openclaw --version 2>/dev/null | head -1 || echo "")
+  fi
+  if [ -z "$openclaw_version" ] || [ "$openclaw_version" = "not found" ]; then
+    local pkg="$HOME/.npm-global/lib/node_modules/openclaw/package.json"
+    if [ -f "$pkg" ]; then
+      if command -v jq &>/dev/null; then
+        openclaw_version=$(jq -r '.version // "not found"' "$pkg" 2>/dev/null || echo "not found")
+      else
+        openclaw_version=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$pkg" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+        [ -z "$openclaw_version" ] && openclaw_version="not found"
+      fi
+    fi
+  fi
+
+  # Hostname
+  local host
+  host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown")
+
+  # Gateway IP -- strip protocol + port from openclaw.json baseUrl
+  local gateway_ip="not found"
+  local openclaw_conf="$HOME/.openclaw/openclaw.json"
+  if [ -f "$openclaw_conf" ] && command -v jq &>/dev/null; then
+    gateway_ip=$(jq -r '.models.providers.confidential.baseUrl // empty' "$openclaw_conf" 2>/dev/null \
+      | sed 's|https://||; s|http://||' \
+      | cut -d: -f1 \
+      | cut -d/ -f1)
+    [ -z "$gateway_ip" ] && gateway_ip="not found"
+  fi
+
+  # Install date
+  local installed="not found"
+  if [ -f /usr/local/bin/privateclaw ]; then
+    installed=$(stat -c %y /usr/local/bin/privateclaw 2>/dev/null | cut -d' ' -f1)
+    [ -z "$installed" ] && installed="not found"
+  fi
+
+  # Aligned output (labels padded to 18 chars)
+  printf '%-18s %s\n' "privateclaw:"     "$VERSION"
+  printf '%-18s %s\n' "attestation-cli:" "$att_version"
+  printf '%-18s %s\n' "openclaw:"        "$openclaw_version"
+  printf '%-18s %s\n' "Hostname:"        "$host"
+  printf '%-18s %s\n' "Gateway IP:"      "$gateway_ip"
+  printf '%-18s %s\n' "Installed:"       "$installed"
+}
+
+# ---------------------------------------------------------------------------
 # Main dispatch
 # ---------------------------------------------------------------------------
 case "${1:-}" in
   attest)  shift; cmd_attest "$@" ;;
   verify)  shift; cmd_verify "$@" ;;
   assign)  shift; cmd_assign "$@" ;;
+  info)    shift; cmd_info "$@" ;;
   *)
     echo "Usage: privateclaw <command> [flags]"
     echo ""
@@ -908,5 +971,6 @@ case "${1:-}" in
     echo "                          -v/--verbose shows full cert chain and diagnostic details"
     echo "  attest                  Generate attestation evidence (run at boot)"
     echo "  assign                  Apply user configuration from IMDS (run by systemd)"
+    echo "  info                    Print component versions, hostname, gateway IP, and install date"
     ;;
 esac
