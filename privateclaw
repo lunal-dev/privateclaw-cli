@@ -5,7 +5,7 @@ set -e
 # TEE verification and management for PrivateClaw CVMs.
 # https://github.com/lunal-dev/privateclaw-cli (repo name unchanged)
 
-VERSION="v1.5.7"
+VERSION="v1.5.8"
 
 ATTEST_DIR="/etc/privateclaw"
 EVIDENCE_FILE="$ATTEST_DIR/evidence.json"
@@ -676,8 +676,28 @@ PYEOF
   # ==========================================================================
   echo "[5/$TOTAL_CHECKS] External Access Lockout"
 
-  KEY_COUNT=$(grep -c '^ssh-' "$ADMIN_HOME/.ssh/authorized_keys" 2>/dev/null || echo 0)
-  KEY_COUNT="${KEY_COUNT:-0}"
+  # Count authorized SSH keys. Two subtleties bit the previous version:
+  #  1. `grep -c` exits 1 when it finds zero matches. Combined with a
+  #     `|| echo 0` fallback, stdout concatenated "0\n" (from grep) + "0\n"
+  #     (from echo); command substitution stripped the trailing newline,
+  #     leaving KEY_COUNT="0\n0". That broke the display (two-line
+  #     "0\n0 authorized") AND the numeric comparison ([: 0\n0: integer
+  #     expression expected).
+  #  2. The old regex `^ssh-` missed ecdsa-* and sk-* key types, so users
+  #     with ECDSA or hardware-security keys would get KEY_COUNT=0 and
+  #     FAIL the step even with a valid key configured.
+  # Fix: match all standard OpenSSH key-type prefixes, and swallow grep's
+  # non-zero exit with `|| :` (no extra stdout) instead of `|| echo 0`.
+  if [ -r "$ADMIN_HOME/.ssh/authorized_keys" ]; then
+    KEY_COUNT=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$ADMIN_HOME/.ssh/authorized_keys" 2>/dev/null || :)
+  else
+    KEY_COUNT=0
+  fi
+  # Defensive: if KEY_COUNT is empty or contains non-digits, reset to 0
+  # so the `[ -le 1 ]` comparison below never sees a multi-line string.
+  case "$KEY_COUNT" in
+    ''|*[!0-9]*) KEY_COUNT=0 ;;
+  esac
   echo "  SSH keys:      $KEY_COUNT authorized"
 
   if command -v ufw &>/dev/null; then
