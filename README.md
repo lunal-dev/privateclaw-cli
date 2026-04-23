@@ -2,48 +2,83 @@
 
 TEE verification and management CLI for [PrivateClaw](https://privateclaw.dev) CVMs.
 
+PrivateClaw runs your inference workloads inside fully encrypted confidential VMs. This CLI lets you cryptographically confirm that a CVM really is a genuine TEE — and inspect its state.
+
+For background on TEEs and remote attestation, see [confidential.ai/docs](https://confidential.ai/docs).
+
 ## Install
 
 ```bash
-curl -fsSL https://github.com/lunal-dev/privateclaw-cli/releases/download/v1.0.0/install.sh | bash
+curl -fsSL https://github.com/lunal-dev/privateclaw-cli/releases/latest/download/install.sh | bash
 ```
 
 This installs two binaries to `/usr/local/bin/`:
-- `privateclaw` — shell script CLI with `verify`, `attest`, and `assign` subcommands
-- `attestation-cli` — pre-built binary from [attestation-rs](https://github.com/lunal-dev/attestation-rs) for cryptographic TEE attestation
+
+- `privateclaw` — the CLI shell script (this repo)
+- `attestation-cli` — pre-built binary from [lunal-dev/attestation-rs](https://github.com/lunal-dev/attestation-rs) that performs the cryptographic SEV-SNP and TPM attestation
 
 ## Commands
 
+```
+privateclaw <command> [flags]
+```
+
+| Command | Description |
+|---|---|
+| `verify [-v\|--verbose]` | Run the full 5-check TEE verification |
+| `info` | Print component versions, hostname, gateway IP, install date |
+| `attest` | Generate attestation evidence (boot-time; run by cloud-init) |
+| `assign` | Apply user configuration from IMDS (internal; run by systemd) |
+
 ### `privateclaw verify`
 
-User-facing command. Cryptographically verifies your CVM is running in a genuine TEE:
+User-facing command. Runs five checks and prints a pass/fail summary:
 
-1. **TEE Attestation** — validates AMD SEV-SNP attestation evidence via `attestation-cli`, confirms SSH host key is bound to the TEE
-2. **Inference Provider** — shows configured Lunal inference endpoint
-3. **External Access Lockout** — audits SSH authorized keys and firewall
+1. **SEV-SNP Hardware** — requests a fresh AMD SEV-SNP attestation report bound to the current SSH host key hash and validates the full cert chain via `attestation-cli`.
+2. **TPM Attestation** — validates the vTPM quote and AK cert chain.
+3. **Host Key Binding** — confirms the live SSH host key matches the key baked into the attestation evidence (so MITM is impossible).
+4. **Inference Provider** — shows the configured Lunal inference endpoint.
+5. **External Access Lockout** — audits `authorized_keys`, firewall rules, and cloud-provider access paths (waagent / VM extensions) to confirm no operator backdoor.
+
+Add `-v` / `--verbose` for full cert-chain, VCEK, and endpoint diagnostics.
+
+### `privateclaw info`
+
+Prints a compact status block — useful for bug reports and quick sanity checks:
+
+```
+privateclaw:       v1.5.7
+attestation-cli:   v0.4.1
+openclaw:          <version>
+Hostname:          <fqdn>
+Gateway IP:        <gateway>
+Installed:         <date>
+```
 
 ### `privateclaw attest`
 
-Boot-time command (called by cloud-init). Generates attestation evidence binding the SSH host key to the TEE hardware.
+Boot-time command invoked by cloud-init. Generates SEV-SNP + TPM attestation evidence binding the SSH host key to the TEE hardware and writes it to `/etc/privateclaw/evidence.json`.
 
 ### `privateclaw assign`
 
-Internal command (called by systemd timer). Polls Azure IMDS for user configuration and applies it.
+Internal command invoked by a systemd timer. Polls Azure IMDS for user configuration (SSH keys, inference endpoint) and applies it to the CVM.
 
-## Independent Verification
+## Independent verification
 
-You can verify a CVM's attestation evidence from any machine:
+You can verify a CVM's attestation evidence from any machine — you don't need to trust this CLI:
 
 ```bash
-# Copy evidence from CVM
+# Copy evidence off the CVM
 scp user@cvm:/etc/privateclaw/evidence.json .
 
-# Verify locally (install attestation-cli first)
+# Verify locally with attestation-cli
 attestation-cli verify -e evidence.json --expected-report-data <host_key_hash_hex>
 ```
 
 ## Auditing
 
-This repo contains everything that runs on your CVM. The `privateclaw` script is a single shell file — read it directly to see exactly what it does.
+Everything that runs on your CVM lives in this repo. `privateclaw` is a single bash script — read it top to bottom to see exactly what it does. The only binary dependency is [`attestation-cli`](https://github.com/lunal-dev/attestation-rs), which is also open source.
 
-The only binary dependency is [`attestation-cli`](https://github.com/lunal-dev/attestation-rs), which is also open source.
+## License
+
+[MIT](./LICENSE)
